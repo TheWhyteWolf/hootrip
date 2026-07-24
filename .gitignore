@@ -1,0 +1,11 @@
+# Rust build output (any crate, including vendored ones)
+target/
+
+# Rip outputs / audition renders / diagnostics
+out/
+*.wav
+/pc98_out.*
+/manifest.jsonl
+
+# Local-only working notes (not part of the published project)
+/CLAUDE.md

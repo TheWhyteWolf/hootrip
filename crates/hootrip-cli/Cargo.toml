@@ -1,0 +1,17 @@
+[package]
+name = "hootrip-cli"
+description = "Batch converter from hoot emulator sets to S98/VGM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hootrip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hoot-xml = { path = "../hoot-xml" }
+hoot-log = { path = "../hoot-log" }
+hoot-machine = { path = "../hoot-machine" }

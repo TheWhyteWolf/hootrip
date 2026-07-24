@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2026 TheWhyteWolf
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+This repository vendors third-party components under their own licenses:
+
+  * vendor/iz80  — Z80 CPU core (BSD-3-Clause), see vendor/iz80/LICENSE
+  * vendor/np2   — NP2 (Neko Project II) i286 CPU core, see vendor/np2/LICENSE-NP2.txt
+
+hootrip produces only chip register logs (S98 / VGM). It does not contain or
+distribute any game ROM, sound data, or copyrighted musical work; those must be
+supplied by the user from their own legally obtained hoot archive.

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hoot-xml",
+    "crates/hoot-log",
+    "crates/hoot-chips",
+    "crates/hoot-cpu",
+    "crates/hoot-machine",
+    "crates/hootrip-cli",
+]
+exclude = ["vendor/iz80"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/TheWhyteWolf/hootrip"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+quick-xml = "0.37"
+encoding_rs = "0.8"
+flate2 = "1"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+
+[profile.release]
+lto = true
+strip = true

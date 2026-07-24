@@ -1,0 +1,11 @@
+[package]
+name = "hoot-cpu"
+description = "Real-mode x86 (8086/V30/286) CPU abstraction and vendored NP2 i286c core for PC-98 re-hosting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"

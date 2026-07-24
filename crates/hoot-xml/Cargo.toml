@@ -1,0 +1,13 @@
+[package]
+name = "hoot-xml"
+description = "Parser for hoot emulator gamelist XML descriptors and archive layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+quick-xml.workspace = true
+encoding_rs.workspace = true
+walkdir.workspace = true

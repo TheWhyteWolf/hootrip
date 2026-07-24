@@ -1,0 +1,8 @@
+[package]
+name = "hoot-chips"
+description = "Sound-chip front-ends for register logging: bus/status/timer/IRQ behaviour without audio synthesis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

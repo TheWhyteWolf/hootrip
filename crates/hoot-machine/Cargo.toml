@@ -1,0 +1,14 @@
+[package]
+name = "hoot-machine"
+description = "Per-platform machine harnesses that re-host hoot sound drivers and log chip writes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hoot-xml = { path = "../hoot-xml" }
+hoot-log = { path = "../hoot-log" }
+hoot-chips = { path = "../hoot-chips" }
+hoot-cpu = { path = "../hoot-cpu" }
+iz80 = { path = "../../vendor/iz80" }
