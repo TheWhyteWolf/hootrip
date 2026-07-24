@@ -193,6 +193,9 @@ pub fn rip_title(
     let cpu_hz = (PC88_CPU_HZ as u64) * opts.clockmul.max(1) as u64;
 
     let mut bus = Pc88Bus::new(PC88_OPN_CLOCK_HZ, cpu_hz);
+    // OPNA sets carry a YM2608 Sound Board II; mark the chip so register-0xFF
+    // reads return the OPNA identity byte that drivers like MUCOM88 probe for.
+    bus.opn.set_opna(game.driver.kind.as_deref() == Some("opna"));
     let mut cpu = Cpu::new_z80();
 
     // --- Load code images -------------------------------------------------
@@ -227,12 +230,20 @@ pub fn rip_title(
     // Family (b) is not yet emulated (needs the per-driver destination); such
     // sets currently produce no writes rather than erroring. TODO: port-0x00
     // bank-copy handler. See sweep findings in the project plan.
+    // MUCOM88 (v1.5+) uses a different data/trigger model than the classic
+    // PATCH: its compiled song data (`bgm`) is read by the driver's WORKINIT at
+    // MU_TOP (0xC205), and its 127-byte patch triggers play with `CALL 0xEEA7`
+    // — a routine real hoot injects but that is otherwise unmapped RAM here.
+    let is_mucom =
+        game.driver_alias.as_ref().is_some_and(|a| a.label.eq_ignore_ascii_case("Mucom"));
+    const MUCOM_DATA_ADDR: i64 = 0xC205; // MU_TOP: MUSICNUM(0xC200)+5
+    let bgm_addr = if is_mucom { Some(MUCOM_DATA_ADDR) } else { mdata_addr };
     if let Some(bgm) = romlist
         .roms
         .iter()
         .find(|r| r.kind == "bgm" && r.offset == Some(song as i64))
     {
-        if let Some(addr) = mdata_addr {
+        if let Some(addr) = bgm_addr {
             let data = read_set_file(set_dir, &bgm.name)?;
             let start = addr as usize;
             if start + data.len() > 0x10000 {
@@ -242,6 +253,16 @@ pub fn rip_title(
         }
     }
 
+    // Replicate hoot's injected MUCOM play trigger: stub 0xEEA7 as `XOR A;
+    // JP MSTART` (music+0 = 0xB000). The patch calls it with the song number,
+    // but each hoot MUCOM `bgm` file is a single-song MUB, so play index 0.
+    if is_mucom {
+        bus.mem[0xEEA7] = 0xAF; // XOR A
+        bus.mem[0xEEA8] = 0xC3; // JP nn
+        bus.mem[0xEEA9] = 0x00;
+        bus.mem[0xEEAA] = 0xB0; // -> 0xB000 (JP MSTART)
+    }
+
     let opt_flag = |name: &str| {
         game.options
             .iter()
@@ -249,6 +270,19 @@ pub fn rip_title(
     };
     let use_rtc = opt_flag("use_rtc");
     let use_vrtc = opt_flag("use_vrtc");
+
+    // hoot's `init_pc` option is the driver's entry point. Most sets omit it
+    // (or set 0) and load their PATCH at 0x0000, which the Z80 reset already
+    // enters; ~130 pc88 sets — including the whole MUCOM88/muco family — load
+    // the PATCH higher (0x8000, 0xf000, …) and rely on init_pc to jump there.
+    // Without it the CPU NOP-slides from 0x0000 and never reaches the driver.
+    let init_pc = game
+        .options
+        .iter()
+        .find(|o| o.name == "init_pc")
+        .and_then(|o| parse_num(&o.value))
+        .unwrap_or(0);
+    cpu.registers().set_pc(init_pc as u16);
 
     // --- Boot: let the PATCH reach its poll loop --------------------------
     let boot_cycles = (opts.boot_seconds * cpu_hz as f64) as u64;
@@ -269,7 +303,11 @@ pub fn rip_title(
     runner.run_until(boot_cycles);
 
     // --- Trigger playback ---------------------------------------------------
+    // Song number is exposed on port 0x80 (song) for the classic PATCH and on
+    // port 0x01 (param) for the MUCOM88 patch, which reads IN(0x01) after
+    // seeing cmd==1; set both so either bootstrap picks it up.
     runner.bus.song = song;
+    runner.bus.param = song;
     runner.bus.cmd = 1;
     let t0 = runner.cpu.cycle_count();
     let end = t0 + (opts.seconds * cpu_hz as f64) as u64;

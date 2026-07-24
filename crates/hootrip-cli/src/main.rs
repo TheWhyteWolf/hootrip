@@ -232,6 +232,10 @@ enum Cmd {
         /// Cap the number of sets processed this run (0 = all outstanding)
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// Restrict to sets whose romlist archive folder name appears in this
+        /// file (one name per line, '#' comments allowed). Case-insensitive.
+        #[arg(long)]
+        only_archives: Option<PathBuf>,
         /// Ignore the existing manifest and re-rip every matching set
         #[arg(long)]
         no_resume: bool,
@@ -275,9 +279,10 @@ fn main() -> Result<()> {
         }
         Cmd::ArchiveRip {
             out, manifest, platforms, kinds, jobs, seconds, timeout, format, limit, no_resume, retry_failed, dry_run,
+            only_archives,
         } => archive_rip(
             &archive_path, &cat, &out, manifest.as_ref(), &platforms, &kinds, jobs, seconds, timeout, &format,
-            limit, no_resume, retry_failed, dry_run,
+            limit, no_resume, retry_failed, dry_run, only_archives.as_ref(),
         )?,
     }
     Ok(())
@@ -1472,6 +1477,7 @@ fn archive_rip(
     no_resume: bool,
     retry_failed: bool,
     dry_run: bool,
+    only_archives: Option<&PathBuf>,
 ) -> Result<()> {
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -1483,6 +1489,21 @@ fn archive_rip(
         platforms.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
     let want_kinds: HashSet<String> =
         kinds.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+
+    // Optional allow-list of set-folder names (for targeted re-rips / smoketests).
+    let only: Option<HashSet<String>> = match only_archives {
+        Some(path) => {
+            let data = std::fs::read_to_string(path)
+                .with_context(|| format!("reading --only-archives {}", path.display()))?;
+            let set: HashSet<String> = data
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(set)
+        }
+        None => None,
+    };
 
     // Enumerate targets in catalogue order (== the order `rip-one --ordinal`
     // reproduces from the same archive, so ordinals are stable across runs).
@@ -1496,12 +1517,14 @@ fn archive_rip(
         if !want_kinds.contains(&kind) {
             continue;
         }
-        let has_dir = g
-            .romlist
-            .as_ref()
-            .and_then(|r| r.archive.as_deref())
-            .and_then(|a| cat.find_set_dir(a))
-            .is_some();
+        let archive_name = g.romlist.as_ref().and_then(|r| r.archive.as_deref());
+        if let Some(allow) = &only {
+            match archive_name {
+                Some(a) if allow.contains(&a.to_lowercase()) => {}
+                _ => continue,
+            }
+        }
+        let has_dir = archive_name.and_then(|a| cat.find_set_dir(a)).is_some();
         if !has_dir {
             nofolder += 1;
             continue;

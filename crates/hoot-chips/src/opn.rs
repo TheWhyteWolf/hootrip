@@ -31,6 +31,11 @@ pub struct Opn {
     pub last_write: Option<(u8, u8, u8)>,
     /// True once any bank-1 (OPNA extended) register was written.
     pub port1_used: bool,
+    /// Chip is a YM2608 (OPNA), not a YM2203 (OPN). fmgen's `OPNA::GetReg`
+    /// returns 1 for register 0xFF as the board's identity byte; drivers such
+    /// as MUCOM88 probe it (write 0xFF to the address port, read the data port,
+    /// expect 1) to detect the PC-8801 Sound Board II. A plain OPN returns 0.
+    opna: bool,
     /// OPNA 6-channel ("extended") mode. On the PC-9801-86 the bank-1 status
     /// and data ports read back 0xFF until the driver enables extended mode
     /// (via the board's PCM control bit); only then do they expose the ADPCM/
@@ -96,6 +101,7 @@ impl Opn {
             timer_b: Timer::new(),
             last_write: None,
             port1_used: false,
+            opna: false,
             extend: false,
             irq_line: false,
             irq_edge: false,
@@ -247,11 +253,18 @@ impl Opn {
                 let load_b = v & 0x02 != 0;
                 self.timer_a.enabled = v & 0x04 != 0;
                 self.timer_b.enabled = v & 0x08 != 0;
+                // Refresh the reload period from the current NA/NB. A driver may
+                // never write 0x24-0x26 and rely on the reset default (NB=0 →
+                // period 16×256), so the `period` field must be current at load
+                // time, not just when a period register is written (else it
+                // keeps the Timer::new placeholder and mis-reloads on overflow).
+                self.timer_a.period = self.timer_a_period();
+                self.timer_b.period = self.timer_b_period();
                 if load_a && !self.timer_a.running {
-                    self.timer_a.counter = self.timer_a_period();
+                    self.timer_a.counter = self.timer_a.period;
                 }
                 if load_b && !self.timer_b.running {
-                    self.timer_b.counter = self.timer_b_period();
+                    self.timer_b.counter = self.timer_b.period;
                 }
                 self.timer_a.running = load_a;
                 self.timer_b.running = load_b;
@@ -273,14 +286,23 @@ impl Opn {
         (self.timer_a.flag as u8) | ((self.timer_b.flag as u8) << 1)
     }
 
-    /// Data read (A0=1): SSG registers 0x00-0x0F read back; FM registers are
-    /// write-only on real silicon and return 0.
+    /// Data read (A0=1): SSG registers 0x00-0x0F read back; register 0xFF reads
+    /// as the OPNA identity byte (1) so sound-board detection succeeds; other FM
+    /// registers are write-only on real silicon and return 0.
     pub fn read_data(&self) -> u8 {
         if self.addr[0] < 0x10 {
             self.regs[0][self.addr[0] as usize]
+        } else if self.addr[0] == 0xFF && self.opna {
+            1
         } else {
             0
         }
+    }
+
+    /// Mark this instance as an OPNA (YM2608) so register-0xFF reads identify
+    /// the Sound Board II. See the `opna` field.
+    pub fn set_opna(&mut self, v: bool) {
+        self.opna = v;
     }
 
     /// Current bank-0 address latch (diagnostics + detection readback).
