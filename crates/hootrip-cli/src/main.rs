@@ -2150,7 +2150,20 @@ fn triage(
             }
         }
     }
+    // A set whose every track was silent leaves an empty folder behind.
+    // remove_dir refuses to touch a non-empty directory, so this can only
+    // ever clear the ones the move emptied.
+    let mut pruned = 0usize;
+    for set in sets.keys() {
+        if std::fs::remove_dir(set).is_ok() {
+            pruned += 1;
+        }
+    }
+
     println!("\n  moved {moved} file(s) to {}", qdir.display());
+    if pruned > 0 {
+        println!("  pruned {pruned} set folder(s) left empty");
+    }
     if failed > 0 {
         println!("  {failed} file(s) could not be moved");
     }
