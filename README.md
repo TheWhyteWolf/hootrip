@@ -84,8 +84,9 @@ of what ripped and what did not.
 - `vendor/np2` — NP2 i286 CPU core
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for build notes and verification
-tooling, and [docs/pc98-driver-families.md](docs/pc98-driver-families.md) for the
-per-driver re-hosting details.
+tooling, [docs/pc98-driver-families.md](docs/pc98-driver-families.md) for the
+per-driver re-hosting details, and [docs/silent-rips.md](docs/silent-rips.md) for
+how silent output is measured and classified.
 
 ## Format references
 

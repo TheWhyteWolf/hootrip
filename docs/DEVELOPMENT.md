@@ -16,7 +16,11 @@ Practical notes for building on and hacking hootrip.
   Python for archive text searches.
 - Point the tool at your own unpacked HootArchive with `--archive <path>`; that
   directory holds `hoot.xml` plus the `xml/`, `xml2/`, and per-platform data
-  folders.
+  folders. **The presence of a folder named `HootArchive…` proves nothing** —
+  check for `hoot.xml` itself. Without the catalogue the tool cannot enumerate
+  or bind anything, and `hootrip triage` is the only subcommand that still runs.
+- **hoot's own sources are Shift_JIS too**, so the `ugrep` trap above applies to
+  them as well as to the gamelists — decode explicitly when searching them.
 
 ## Verification tools
 

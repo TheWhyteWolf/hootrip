@@ -38,6 +38,8 @@ emulation, and logs every chip register write.
 
 - [PC-98 driver families](pc98-driver-families.html) — how each sound-driver
   family delivers a song and how the harness reproduces it.
+- [Silent rips](silent-rips.html) — measuring which captures actually make a
+  sound, the audibility classifier, and the causes of the ones that do not.
 - [Development notes](DEVELOPMENT.html) — building, verification tooling, and the
   ground-truth methodology.
 
