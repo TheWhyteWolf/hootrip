@@ -170,6 +170,11 @@ enum Cmd {
         /// Print IRQ/port diagnostics per title
         #[arg(long)]
         verbose: bool,
+        /// Override where the selected bgm file is loaded (e.g. 0x4000).
+        /// Bring-up aid for sets whose PATCH names an address the catalogue
+        /// does not record in `mdata_addr`.
+        #[arg(long, value_parser = parse_hex_addr)]
+        mdata_addr: Option<i64>,
     },
     /// Rip one catalogue entry addressed by its ordinal (index into the loaded
     /// catalogue). This is the isolated per-set unit `archive-rip` forks; it
@@ -286,8 +291,8 @@ fn main() -> Result<()> {
         Cmd::Stats => stats(&cat),
         Cmd::List { platform, name } => list(&cat, platform.as_deref(), name.as_deref()),
         Cmd::Show { name } => show(&cat, &name),
-        Cmd::Rip { game, index, seconds, out, format, verbose } => {
-            rip(&cat, &game, index, seconds, &out, &format, verbose)?
+        Cmd::Rip { game, index, seconds, out, format, verbose, mdata_addr } => {
+            rip(&cat, &game, index, seconds, &out, &format, verbose, mdata_addr)?
         }
         Cmd::Compare { game, index, reference, seconds } => {
             compare_cmd(&cat, &game, index, &reference, seconds)?
@@ -986,6 +991,7 @@ fn compare_cmd(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rip(
     cat: &Catalogue,
     game_query: &str,
@@ -994,6 +1000,7 @@ fn rip(
     out: &PathBuf,
     format: &str,
     verbose: bool,
+    mdata_addr: Option<i64>,
 ) -> Result<()> {
     use hoot_log::s98::{write_s98, S98Tags};
     use hoot_log::{write_vgz, Gd3};
@@ -1002,6 +1009,7 @@ fn rip(
     let opts = hoot_machine::RipOptions {
         seconds,
         clockmul: clockmul_of(g),
+        mdata_addr,
         ..Default::default()
     };
 
@@ -1771,6 +1779,23 @@ fn archive_rip(
     }
     eprintln!("manifest: {}", manifest_path.display());
     Ok(())
+}
+
+/// Parse an address written as `0x4000`, `4000h`, or plain decimal.
+fn parse_hex_addr(s: &str) -> Result<i64, String> {
+    let t = s.trim();
+    let parsed = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(h, 16)
+    } else if let Some(h) = t.strip_suffix('h').or_else(|| t.strip_suffix('H')) {
+        i64::from_str_radix(h, 16)
+    } else {
+        t.parse::<i64>()
+    };
+    match parsed {
+        Ok(v) if (0..=0xFFFF).contains(&v) => Ok(v),
+        Ok(v) => Err(format!("address {v:#x} is outside the 64K Z80 address space")),
+        Err(e) => Err(format!("{t:?}: {e}")),
+    }
 }
 
 fn sanitize(name: &str) -> String {

@@ -208,11 +208,15 @@ pub struct RipOptions {
     pub boot_seconds: f64,
     /// CPU clock multiplier (hoot `clockmul`; PC-88 default 1).
     pub clockmul: u32,
+    /// Override the address the selected `bgm` file is loaded at, taking
+    /// precedence over the set's `mdata_addr` option. Bring-up aid for sets
+    /// whose PATCH names a data address the catalogue does not record.
+    pub mdata_addr: Option<i64>,
 }
 
 impl Default for RipOptions {
     fn default() -> Self {
-        RipOptions { seconds: 120.0, boot_seconds: 0.5, clockmul: 1 }
+        RipOptions { seconds: 120.0, boot_seconds: 0.5, clockmul: 1, mdata_addr: None }
     }
 }
 
@@ -226,14 +230,99 @@ pub struct RipOutcome {
     pub vectors: [u16; 8],
     /// On-demand song-bank loads the driver requested over port 0x00.
     pub bank_loads: u64,
+    /// Set when a speculative data address was probed and accepted, so callers
+    /// can report which sets are relying on it.
+    pub bgm_addr_used: Option<i64>,
 }
 
+/// MU_TOP: MUSICNUM(0xC200)+5, where MUCOM88's WORKINIT reads its song data.
+const MUCOM_DATA_ADDR: i64 = 0xC205;
+
+/// Does this set use the MUCOM88 data/trigger model?
+fn is_mucom(game: &Game) -> bool {
+    game.driver_alias.as_ref().is_some_and(|a| a.label.eq_ignore_ascii_case("Mucom"))
+}
+
+/// The bgm load address a set declares, if any.
+fn declared_bgm_addr(game: &Game) -> Option<i64> {
+    game.options
+        .iter()
+        .find(|o| o.name == "mdata_addr")
+        .and_then(|o| parse_num(&o.value))
+}
+
+/// Addresses to try when a set names none of its own.
+///
+/// The hoot PATCH hands its driver a pointer to the song data — `agni`'s stub,
+/// for instance, does `LD IX,0x4000` immediately before calling the driver —
+/// but the catalogue only records that address in `mdata_addr` for some sets.
+/// Where it is absent the song is never placed anywhere, the driver plays
+/// nothing, and (since the title code then changes no machine state) every
+/// title in the set captures an identical, silent log.
+///
+/// Reading the address back out of the PATCH statically proved unreliable: over
+/// the 546 pc88 sets, a linear scan for the register load feeding the driver
+/// call agreed with the declared `mdata_addr` on 14 sets and disagreed on 37.
+/// So instead of trusting a disassembly, each candidate is *tried* and kept
+/// only if the capture actually makes a sound.
+///
+/// Empirically 0x4000 is the dominant convention: forcing it recovered 33 of
+/// the 68 affected sets (21 of them completely, e.g. Agni no Ishi 17/17,
+/// Illumina 30/30, Laplace no Ma 22/22). The remaining sets fail for unrelated
+/// reasons — sweeping 0x1000..0xC000 on them recovers nothing — so this list is
+/// deliberately short rather than speculative.
+const DATA_ADDR_CANDIDATES: &[i64] = &[0x4000];
+
+/// Seconds to run a speculative probe before committing to a full capture.
+/// Long enough for a driver to key its first notes, short enough to be cheap.
+const PROBE_SECONDS: f64 = 12.0;
+
 /// Rip one title from a pc88 game: load, boot, trigger, run, log.
+///
+/// When the set declares no data address and the straightforward capture comes
+/// out silent, candidate addresses are probed and the first that yields audible
+/// output is used for the real run. Sets that already capture sound never reach
+/// the probe, so their behaviour is unchanged.
 pub fn rip_title(
     game: &Game,
     set_dir: &std::path::Path,
     title_code: u64,
     opts: &RipOptions,
+) -> Result<RipOutcome> {
+    let explicit = opts
+        .mdata_addr
+        .or(if is_mucom(game) { Some(MUCOM_DATA_ADDR) } else { declared_bgm_addr(game) });
+    if explicit.is_some() {
+        return rip_title_at(game, set_dir, title_code, opts, explicit, opts.seconds);
+    }
+
+    let plain = rip_title_at(game, set_dir, title_code, opts, None, opts.seconds)?;
+    if !hoot_log::audibility(&plain.log).is_silent() {
+        return Ok(plain);
+    }
+    let probe_secs = opts.seconds.min(PROBE_SECONDS);
+    for &cand in DATA_ADDR_CANDIDATES {
+        let probe = rip_title_at(game, set_dir, title_code, opts, Some(cand), probe_secs)?;
+        if !hoot_log::audibility(&probe.log).is_silent() {
+            let mut full =
+                rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)?;
+            full.bgm_addr_used = Some(cand);
+            return Ok(full);
+        }
+    }
+    Ok(plain)
+}
+
+/// One pass of the machine with an explicit bgm load address and run length.
+/// `bgm_addr` of `None` means "load no song data", which is correct for sets
+/// whose music lives inside a code rom.
+fn rip_title_at(
+    game: &Game,
+    set_dir: &std::path::Path,
+    title_code: u64,
+    opts: &RipOptions,
+    bgm_addr: Option<i64>,
+    seconds: f64,
 ) -> Result<RipOutcome> {
     let romlist = game.romlist.as_ref().context("game has no romlist")?;
     // clockmul scales the CPU only; the OPN keeps its real chip clock.
@@ -262,27 +351,13 @@ pub fn rip_title(
         bus.mem[start..start + data.len()].copy_from_slice(&data);
     }
 
-    // --- Load the selected bgm file at mdata_addr -------------------------
+    // --- Load the selected bgm file at the caller's address ----------------
     let song = (title_code & 0xFF) as u8;
-    let mdata_addr = game
-        .options
-        .iter()
-        .find(|o| o.name == "mdata_addr")
-        .and_then(|o| parse_num(&o.value));
-    // Load the selected song's bgm bank at mdata_addr when the set declares
-    // one. Sets without mdata_addr fall into two families: (a) placeholder
-    // "DUMMY" bgm entries whose music actually lives in a code rom — nothing
-    // to load; (b) drivers that copy the bank on demand when the song number
-    // is written to port 0x00. Family (b) is served by `Pc88Bus::load_bank`,
-    // armed below for exactly the sets that would otherwise preload nothing.
     // MUCOM88 (v1.5+) uses a different data/trigger model than the classic
     // PATCH: its compiled song data (`bgm`) is read by the driver's WORKINIT at
     // MU_TOP (0xC205), and its 127-byte patch triggers play with `CALL 0xEEA7`
     // — a routine real hoot injects but that is otherwise unmapped RAM here.
-    let is_mucom =
-        game.driver_alias.as_ref().is_some_and(|a| a.label.eq_ignore_ascii_case("Mucom"));
-    const MUCOM_DATA_ADDR: i64 = 0xC205; // MU_TOP: MUSICNUM(0xC200)+5
-    let bgm_addr = if is_mucom { Some(MUCOM_DATA_ADDR) } else { mdata_addr };
+    let is_mucom = is_mucom(game);
     if let Some(bgm) = romlist
         .roms
         .iter()
@@ -376,7 +451,7 @@ pub fn rip_title(
     runner.bus.param = song;
     runner.bus.cmd = 1;
     let t0 = runner.cpu.cycle_count();
-    let end = t0 + (opts.seconds * cpu_hz as f64) as u64;
+    let end = t0 + (seconds * cpu_hz as f64) as u64;
     runner.run_until(end);
     let irqs = runner.irqs;
 
@@ -408,6 +483,7 @@ pub fn rip_title(
         irqs,
         vectors,
         bank_loads: bus.bank_loads,
+        bgm_addr_used: None,
     })
 }
 
