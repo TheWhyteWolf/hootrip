@@ -218,6 +218,7 @@ dependencies = [
  "hoot-log",
  "hoot-machine",
  "hoot-xml",
+ "walkdir",
 ]
 
 [[package]]

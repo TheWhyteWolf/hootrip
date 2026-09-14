@@ -35,6 +35,12 @@ own legally obtained hoot archive.
 - **Archive rip** — `hootrip archive-rip` batch-rips the whole catalogue: one
   isolated process per set, a bounded parallel worker pool, a resumable JSONL
   census manifest, and stop-track–aware track selection.
+- **Audibility gate** — a capture full of chip-init writes that never keys a
+  note is a well-formed file that renders to silence. Every rip is classified on
+  audible activity (FM key-on, SSG tone past the mixer and envelope, OPNA
+  rhythm, operator TL below maximum attenuation) rather than on write count, so
+  silent titles are neither written nor counted as good. `hootrip triage`
+  applies the same classifier to an output tree that already exists.
 
 ## Usage
 
@@ -55,6 +61,11 @@ hootrip --archive /path/to/HootArchive archive-rip --dry-run                # pl
 # Validate a rip against a reference register log
 hootrip --archive /path/to/HootArchive compare "The 4th Unit (OPN)" \
         --reference ground_truth.s98
+
+# Audit an existing output tree: which tracks can actually make a sound?
+# Reads only the rips -- no archive needed.
+hootrip triage out --report triage.jsonl
+hootrip triage out --quarantine silent/ --apply      # move the silent ones aside
 ```
 
 Each `archive-rip` set records one JSON line in `out/manifest.jsonl`

@@ -30,6 +30,49 @@ fn device_type(chip: Chip) -> Option<u32> {
     })
 }
 
+/// Inverse of [`device_type`]: the chip an S98 device-type code names.
+/// Unknown codes yield `None` rather than a guess.
+pub fn chip_from_device_type(ty: u32) -> Option<Chip> {
+    Some(match ty {
+        1 => Chip::Ym2149,
+        2 => Chip::Ym2203,
+        3 => Chip::Ym2612,
+        4 => Chip::Ym2608,
+        5 => Chip::Ym2151,
+        6 => Chip::Ym2413,
+        7 => Chip::Ym3526,
+        8 => Chip::Ym3812,
+        9 => Chip::Ymf262,
+        15 => Chip::Ay8910,
+        16 => Chip::Sn76489,
+        _ => return None,
+    })
+}
+
+/// Byte offsets of the two header fields that bracket the command stream.
+/// Exposed so callers can digest the dump region alone — the tag block that
+/// follows it carries the per-track title, which would defeat any attempt to
+/// tell whether two tracks decode to the same music.
+pub const TAG_OFS_POS: usize = 0x10;
+pub const DUMP_OFS_POS: usize = 0x14;
+
+/// The dump region of an S98 file: the command stream, without the header,
+/// device table, or trailing tag block. `None` if the header is unusable.
+pub fn dump_region(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 0x20 || &bytes[0..3] != b"S98" {
+        return None;
+    }
+    // Both fields sit inside the fixed 0x20-byte header checked above.
+    let rd = |p: usize| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    let tag = rd(TAG_OFS_POS);
+    let dump = rd(DUMP_OFS_POS);
+    let end = if tag > 0 && tag <= bytes.len() { tag } else { bytes.len() };
+    if dump == 0 || dump > end {
+        return None;
+    }
+    Some(&bytes[dump..end])
+}
+
 /// UTF-8 tag block fields ("[S98]" tag collection). Standard keys:
 /// title, artist, game, year, genre, comment, copyright, s98by, system.
 #[derive(Debug, Default, Clone)]

@@ -15,3 +15,4 @@ clap.workspace = true
 hoot-xml = { path = "../hoot-xml" }
 hoot-log = { path = "../hoot-log" }
 hoot-machine = { path = "../hoot-machine" }
+walkdir.workspace = true

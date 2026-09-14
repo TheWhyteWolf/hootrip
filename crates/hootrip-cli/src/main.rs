@@ -223,9 +223,17 @@ enum Cmd {
         /// Emulated seconds to record per song
         #[arg(long, default_value_t = 210.0)]
         seconds: f64,
-        /// Per-set wall-clock timeout in seconds (spinning sets are killed)
-        #[arg(long, default_value_t = 120.0)]
+        /// Absolute per-set wall-clock ceiling in seconds. The effective budget
+        /// is `songs * title_deadline` capped by this, so a large healthy set
+        /// gets the time it needs while one pathological set can't hog a worker
+        /// indefinitely.
+        #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
+        /// Per-song wall-clock spin-guard in seconds. A single song that runs
+        /// this long (a driver stuck in a busy loop) is abandoned; healthy songs
+        /// finish in well under a second to a few seconds, so keep margin.
+        #[arg(long, default_value_t = 45.0)]
+        title_deadline: f64,
         /// Output formats: s98, vgz, or both
         #[arg(long, default_value = "both")]
         format: String,
@@ -246,10 +254,31 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Classify already-exported rips by whether they can actually make sound,
+    /// and flag sets whose songs are all byte-identical. Reads only the output
+    /// tree — no hoot archive required.
+    Triage {
+        /// Directory of exported rips (an `archive-rip --out` tree)
+        dir: PathBuf,
+        /// Write a per-track JSONL report here
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Directory to move silent tracks into (with their .vgz twins)
+        #[arg(long)]
+        quarantine: Option<PathBuf>,
+        /// Actually move the files. Without this the command only reports.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Triage inspects exported rips only. It must run with no hoot archive
+    // present, so it is dispatched before the catalogue is loaded.
+    if let Cmd::Triage { dir, report, quarantine, apply } = &cli.cmd {
+        return triage(dir, report.as_deref(), quarantine.as_deref(), *apply);
+    }
     let archive_path = cli.archive.clone();
     let cat = Catalogue::load(&archive_path)?;
 
@@ -278,12 +307,14 @@ fn main() -> Result<()> {
             println!("{}", sum.to_json());
         }
         Cmd::ArchiveRip {
-            out, manifest, platforms, kinds, jobs, seconds, timeout, format, limit, no_resume, retry_failed, dry_run,
-            only_archives,
+            out, manifest, platforms, kinds, jobs, seconds, timeout, title_deadline, format, limit, no_resume,
+            retry_failed, dry_run, only_archives,
         } => archive_rip(
-            &archive_path, &cat, &out, manifest.as_ref(), &platforms, &kinds, jobs, seconds, timeout, &format,
-            limit, no_resume, retry_failed, dry_run, only_archives.as_ref(),
+            &archive_path, &cat, &out, manifest.as_ref(), &platforms, &kinds, jobs, seconds, timeout, title_deadline,
+            &format, limit, no_resume, retry_failed, dry_run, only_archives.as_ref(),
         )?,
+        // Handled above, before the catalogue load.
+        Cmd::Triage { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -448,6 +479,8 @@ fn pc98_diag(
         println!("      {seg:#06x} owner={owner:#06x} {size:#06x}p -> {:#06x}  [{kind}]", seg + 1 + size);
     }
 
+    // Deliberately not gated on audibility: a silent log is exactly what you
+    // want dumped for inspection when debugging a set that plays nothing.
     if !o.log.writes.is_empty() {
         use hoot_log::s98::{write_s98, S98Tags};
         use hoot_log::{write_vgz, Gd3};
@@ -727,7 +760,7 @@ fn pc98_sweep(
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
         }
         let (status, ext) = match hoot_machine::pc98::rip_title(g, &set_dir, t0.code, &opts) {
-            Ok(o) if !o.log.writes.is_empty() => {
+            Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
                 ok += 1;
                 ke.0 += 1;
                 let ext = o.log.writes.iter().any(|w| w.port == 1);
@@ -811,7 +844,7 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
 
         let opts = hoot_machine::RipOptions { seconds, clockmul: clockmul_of(g), ..Default::default() };
         match hoot_machine::rip_title(g, &set_dir, t0.code, &opts) {
-            Ok(o) if !o.log.writes.is_empty() => {
+            Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
                 ok += 1;
                 ke.0 += 1;
             }
@@ -1073,7 +1106,13 @@ struct SetSummary {
     status: String,
     titles: usize,
     ripped: usize,
+    /// Titles dropped because nothing was ever keyed on (dead log).
     silent_titles: usize,
+    /// Titles dropped because notes played but no voice was ever programmed.
+    novoice_titles: usize,
+    /// Titles dropped because their only content is ADPCM, which neither
+    /// writer can currently represent (a format gap, not a failed rip).
+    adpcm_titles: usize,
     stop_skipped: usize,
     writes: usize,
     keyons: usize,
@@ -1085,7 +1124,7 @@ impl SetSummary {
     fn to_json(&self) -> String {
         format!(
             "{{\"ordinal\":{},\"platform\":\"{}\",\"kind\":\"{}\",\"name\":\"{}\",\"archive\":\"{}\",\
-\"status\":\"{}\",\"titles\":{},\"ripped\":{},\"silent\":{},\"stop_skipped\":{},\"writes\":{},\
+\"status\":\"{}\",\"titles\":{},\"ripped\":{},\"silent\":{},\"novoice\":{},\"adpcm\":{},\"stop_skipped\":{},\"writes\":{},\
 \"keyons\":{},\"looped\":{},\"err\":\"{}\"}}",
             self.ordinal,
             json_escape(&self.platform),
@@ -1096,6 +1135,8 @@ impl SetSummary {
             self.titles,
             self.ripped,
             self.silent_titles,
+            self.novoice_titles,
+            self.adpcm_titles,
             self.stop_skipped,
             self.writes,
             self.keyons,
@@ -1198,7 +1239,11 @@ fn finalize_status(sum: &mut SetSummary, any_timeout: bool) {
         } else {
             "silent"
         }
-    } else if sum.silent_titles > 0 || any_timeout {
+    } else if sum.silent_titles > 0
+        || sum.novoice_titles > 0
+        || sum.adpcm_titles > 0
+        || any_timeout
+    {
         "partial"
     } else {
         "ok"
@@ -1234,6 +1279,8 @@ fn rip_one_set(
             titles: 0,
             ripped: 0,
             silent_titles: 0,
+            novoice_titles: 0,
+            adpcm_titles: 0,
             stop_skipped: 0,
             writes: 0,
             keyons: 0,
@@ -1252,6 +1299,8 @@ fn rip_one_set(
         titles: 0,
         ripped: 0,
         silent_titles: 0,
+        novoice_titles: 0,
+        adpcm_titles: 0,
         stop_skipped: 0,
         writes: 0,
         keyons: 0,
@@ -1331,9 +1380,23 @@ fn rip_one_set(
                     any_timeout = true;
                 }
                 apply_out(&mut outcome.log);
-                if outcome.log.writes.is_empty() {
-                    sum.silent_titles += 1;
-                    continue;
+                // A log full of chip-init churn that never keys a note is a
+                // perfectly well-formed file that renders to digital silence;
+                // classify on audible activity, not on write count.
+                match hoot_log::audibility(&outcome.log) {
+                    hoot_log::Audibility::Dead => {
+                        sum.silent_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::NoVoice => {
+                        sum.novoice_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::AdpcmOnly => {
+                        sum.adpcm_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::Audible => {}
                 }
                 sum.writes += outcome.log.writes.len();
                 sum.keyons += count_keyons(&outcome.log);
@@ -1375,9 +1438,23 @@ fn rip_one_set(
                     }
                 };
                 apply_out(&mut outcome.log);
-                if outcome.log.writes.is_empty() {
-                    sum.silent_titles += 1;
-                    continue;
+                // A log full of chip-init churn that never keys a note is a
+                // perfectly well-formed file that renders to digital silence;
+                // classify on audible activity, not on write count.
+                match hoot_log::audibility(&outcome.log) {
+                    hoot_log::Audibility::Dead => {
+                        sum.silent_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::NoVoice => {
+                        sum.novoice_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::AdpcmOnly => {
+                        sum.adpcm_titles += 1;
+                        continue;
+                    }
+                    hoot_log::Audibility::Audible => {}
                 }
                 sum.writes += outcome.log.writes.len();
                 sum.keyons += count_keyons(&outcome.log);
@@ -1439,6 +1516,9 @@ struct Tgt {
     kind: String,
     name: String,
     archive: String,
+    /// Expanded song count — sizes the per-set wall budget so a large but
+    /// perfectly healthy set (hundreds of songs) isn't killed as if it hung.
+    titles: usize,
 }
 
 fn synth_json(t: &Tgt, status: &str, err: &str) -> String {
@@ -1452,6 +1532,8 @@ fn synth_json(t: &Tgt, status: &str, err: &str) -> String {
         titles: 0,
         ripped: 0,
         silent_titles: 0,
+        novoice_titles: 0,
+        adpcm_titles: 0,
         stop_skipped: 0,
         writes: 0,
         keyons: 0,
@@ -1472,6 +1554,7 @@ fn archive_rip(
     jobs: usize,
     seconds: f64,
     timeout: f64,
+    title_deadline: f64,
     format: &str,
     limit: usize,
     no_resume: bool,
@@ -1535,6 +1618,7 @@ fn archive_rip(
             kind,
             name: g.name.clone(),
             archive: g.romlist.as_ref().and_then(|r| r.archive.clone()).unwrap_or_default(),
+            titles: g.expanded_titles().len(),
         });
     }
 
@@ -1574,7 +1658,7 @@ fn archive_rip(
     }
     eprintln!(
         "archive-rip: {} sets to rip ({} already in manifest, {} skipped [no set folder]); \
-{jobs} workers, {seconds:.0}s capture, {timeout:.0}s/set timeout, format={format}",
+{jobs} workers, {seconds:.0}s capture, {title_deadline:.0}s/song guard, {timeout:.0}s/set ceiling, format={format}",
         targets.len(),
         resumed,
         nofolder,
@@ -1606,7 +1690,6 @@ fn archive_rip(
     let n = targets.len();
     let targets = Arc::new(targets);
     let cursor = Arc::new(AtomicUsize::new(0));
-    let grace = std::time::Duration::from_secs_f64(timeout + 15.0);
     let (tx, rx) = mpsc::channel::<(usize, String, String)>();
 
     let mut handles = Vec::new();
@@ -1624,6 +1707,11 @@ fn archive_rip(
                 break;
             }
             let t = &targets[idx];
+            // Per-set wall budget: room for every song to hit its spin-guard,
+            // capped by the absolute ceiling so a hung set can't stall a worker.
+            // +30s covers driver setup and the child's own startup.
+            let grace_secs = ((t.titles as f64) * title_deadline + 30.0).min(timeout);
+            let grace = std::time::Duration::from_secs_f64(grace_secs + 15.0);
             let mut cmd = Command::new(&exe);
             cmd.arg("--archive")
                 .arg(&archive_path)
@@ -1637,7 +1725,7 @@ fn archive_rip(
                 .arg("--format")
                 .arg(&format)
                 .arg("--deadline")
-                .arg(format!("{timeout}"))
+                .arg(format!("{title_deadline}"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
@@ -1845,4 +1933,226 @@ fn show(cat: &Catalogue, name: &str) {
     if titles.len() > 50 {
         println!("  ... {} more", titles.len() - 50);
     }
+}
+
+// ---------------------------------------------------------------------------
+// triage — audit an exported rip tree without needing the hoot archive
+// ---------------------------------------------------------------------------
+
+/// One classified track.
+struct TriagedTrack {
+    /// Path relative to the triage root, e.g. `pc88/[PC-8801] Foo (OPN)/00 Bar.s98`.
+    rel: String,
+    class: hoot_log::Audibility,
+    markers: hoot_log::Markers,
+    /// Identity of the command stream, ignoring the tag block.
+    dump_id: (u64, usize),
+}
+
+/// FNV-1a 64. Not cryptographic — it only has to group identical byte runs
+/// within one set, and it is paired with the region length at every comparison.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn triage(
+    dir: &std::path::Path,
+    report: Option<&std::path::Path>,
+    quarantine: Option<&std::path::Path>,
+    apply: bool,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    if !dir.is_dir() {
+        anyhow::bail!("{} is not a directory", dir.display());
+    }
+    if apply && quarantine.is_none() {
+        anyhow::bail!("--apply needs --quarantine <dir>: this command never deletes anything");
+    }
+
+    // set directory -> its tracks, in discovery order
+    let mut sets: BTreeMap<PathBuf, Vec<TriagedTrack>> = BTreeMap::new();
+    let mut unreadable = 0usize;
+
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("s98") {
+            continue;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let parsed = match hoot_log::read_s98(&bytes) {
+            Ok(p) => p,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let region = hoot_log::s98::dump_region(&bytes).unwrap_or(&[]);
+        let rel = path.strip_prefix(dir).unwrap_or(path).to_string_lossy().into_owned();
+        let set = path.parent().unwrap_or(dir).to_path_buf();
+        sets.entry(set).or_default().push(TriagedTrack {
+            rel,
+            class: hoot_log::audibility_s98(&parsed),
+            markers: hoot_log::markers_s98(&parsed),
+            dump_id: (fnv1a64(region), region.len()),
+        });
+    }
+
+    // --- tally -------------------------------------------------------------
+    let mut dead = 0usize;
+    let mut novoice = 0usize;
+    let mut adpcm_only = 0usize;
+    let mut audible = 0usize;
+    let mut total = 0usize;
+    let mut identical_sets = 0usize;
+    let mut identical_tracks = 0usize;
+    let mut dupgroup_sets = 0usize;
+
+    let mut rep: Option<std::io::BufWriter<std::fs::File>> = match report {
+        Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+        None => None,
+    };
+
+    let mut to_move: Vec<String> = Vec::new();
+
+    for (set, tracks) in &sets {
+        let mut groups: BTreeMap<(u64, usize), usize> = BTreeMap::new();
+        for t in tracks {
+            *groups.entry(t.dump_id).or_default() += 1;
+        }
+        let all_identical = tracks.len() > 1 && groups.len() == 1;
+        let has_dupes = groups.values().any(|&n| n > 1);
+        if all_identical {
+            identical_sets += 1;
+            identical_tracks += tracks.len();
+        } else if has_dupes {
+            dupgroup_sets += 1;
+        }
+        let set_rel = set.strip_prefix(dir).unwrap_or(set).to_string_lossy().into_owned();
+
+        for t in tracks {
+            total += 1;
+            match t.class {
+                hoot_log::Audibility::Dead => dead += 1,
+                hoot_log::Audibility::NoVoice => novoice += 1,
+                hoot_log::Audibility::AdpcmOnly => adpcm_only += 1,
+                hoot_log::Audibility::Audible => audible += 1,
+            }
+            if t.class.is_silent() {
+                to_move.push(t.rel.clone());
+            }
+            if let Some(w) = rep.as_mut() {
+                writeln!(
+                    w,
+                    "{{\"track\":\"{}\",\"set\":\"{}\",\"class\":\"{}\",\"key_on\":{},\
+\"ssg_tone\":{},\"rhythm\":{},\"voiced\":{},\"adpcm\":{},\"dump_hash\":\"{:016x}\",\"dump_len\":{},\
+\"set_all_identical\":{},\"set_distinct\":{},\"set_tracks\":{}}}",
+                    json_escape(&t.rel),
+                    json_escape(&set_rel),
+                    t.class.tag(),
+                    t.markers.key_on,
+                    t.markers.ssg_tone,
+                    t.markers.rhythm,
+                    t.markers.voiced,
+                    t.markers.adpcm,
+                    t.dump_id.0,
+                    t.dump_id.1,
+                    all_identical,
+                    groups.len(),
+                    tracks.len(),
+                )?;
+            }
+        }
+    }
+    if let Some(mut w) = rep {
+        w.flush()?;
+    }
+
+    // --- report ------------------------------------------------------------
+    let pct = |n: usize| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
+    println!("triage {}", dir.display());
+    println!("  {total} tracks in {} sets", sets.len());
+    if unreadable > 0 {
+        println!("  {unreadable} unreadable/unparseable file(s)");
+    }
+    println!("  audible          {audible:>6}  ({:>5.1}%)", pct(audible));
+    println!("  dead (no key-on) {dead:>6}  ({:>5.1}%)", pct(dead));
+    println!("  no voice loaded  {novoice:>6}  ({:>5.1}%)", pct(novoice));
+    println!(
+        "  ADPCM-only       {adpcm_only:>6}  ({:>5.1}%)  [format gap, not a failed rip]",
+        pct(adpcm_only)
+    );
+    println!(
+        "  SILENT total     {:>6}  ({:>5.1}%)",
+        dead + novoice + adpcm_only,
+        pct(dead + novoice + adpcm_only)
+    );
+    println!(
+        "  sets with every track byte-identical: {identical_sets} ({identical_tracks} tracks)"
+    );
+    println!("  sets with smaller duplicate groups:   {dupgroup_sets}");
+    if let Some(p) = report {
+        println!("  report written to {}", p.display());
+    }
+
+    // --- quarantine --------------------------------------------------------
+    let Some(qdir) = quarantine else {
+        if !to_move.is_empty() {
+            println!(
+                "\n  {} silent track(s) would be quarantined; pass --quarantine <dir> --apply to move them",
+                to_move.len()
+            );
+        }
+        return Ok(());
+    };
+    if !apply {
+        println!(
+            "\n  dry run: {} silent track(s) (plus matching .vgz) would move to {}",
+            to_move.len(),
+            qdir.display()
+        );
+        return Ok(());
+    }
+
+    let mut moved = 0usize;
+    let mut failed = 0usize;
+    for rel in &to_move {
+        // Move the .s98 and its .vgz twin, preserving <platform>/<set>/ layout.
+        for ext in ["s98", "vgz"] {
+            let src = dir.join(rel).with_extension(ext);
+            if !src.exists() {
+                continue;
+            }
+            let dst = qdir.join(rel).with_extension(ext);
+            let Some(parent) = dst.parent() else { continue };
+            if std::fs::create_dir_all(parent).is_err() {
+                failed += 1;
+                continue;
+            }
+            // rename() fails across filesystems; fall back to copy+remove.
+            let ok = std::fs::rename(&src, &dst).is_ok()
+                || (std::fs::copy(&src, &dst).is_ok() && std::fs::remove_file(&src).is_ok());
+            if ok {
+                moved += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    }
+    println!("\n  moved {moved} file(s) to {}", qdir.display());
+    if failed > 0 {
+        println!("  {failed} file(s) could not be moved");
+    }
+    Ok(())
 }

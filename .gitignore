@@ -6,6 +6,10 @@ out/
 *.wav
 /pc98_out.*
 /manifest.jsonl
+# `cargo run -p hoot-log --example gen_test` scratch output
+/test.vgm
+/test.vgz
+/test.s98
 
 # Local-only working notes (not part of the published project)
 /CLAUDE.md

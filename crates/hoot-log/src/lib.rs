@@ -9,11 +9,13 @@
 //! Specs: S98 v3 <https://vgmrips.net/mirror/s98spec3.txt>,
 //! VGM 1.71 <https://vgmrips.net/wiki/VGM_Specification>.
 
+pub mod audible;
 pub mod compare;
 pub mod loops;
 pub mod s98;
 pub mod vgm;
 
+pub use audible::{audibility, audibility_s98, markers, markers_s98, Audibility, Markers};
 pub use compare::{compare, CompareReport};
 pub use loops::detect_loop;
 pub use s98::{read_s98, write_s98, ParsedS98};
