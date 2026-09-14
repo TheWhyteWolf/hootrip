@@ -38,6 +38,14 @@ const VEC_RTC: u8 = 0x04;
 const VEC_SOUND: u8 = 0x08;
 /// Clock interrupt rate.
 const RTC_HZ: u64 = 600;
+/// Size of one song bank, and the RAM addresses of the on-demand bank-load
+/// protocol, from hoot's `drivers/mucom88.cpp` (`Mucom88Driver::WritePort`,
+/// `TYPE_GENERIC`): the Z80 writes a song number to port 0x00, the host copies
+/// that bank to the pointer the driver left at `ram[0x5C..=0x5D]` (LE) and
+/// raises LOAD_FLAG.
+const BGM_SIZE: usize = 8 * 1024;
+const BANK_DEST_PTR: usize = 0x5C;
+const LOAD_FLAG: usize = 0xC012;
 /// Vertical retrace rate ×1000 (≈56.4 Hz, PC-88 15 kHz timing). TODO:
 /// calibrate against a hoot s98 log once the Wine ground-truth rig exists.
 const VRTC_MILLIHZ: u64 = 56_400;
@@ -61,6 +69,11 @@ pub struct Pc88Bus {
     pub sound_irq_masked: bool,
     /// port → (reads, writes) for ports we don't model.
     pub unknown_ports: BTreeMap<u8, (u64, u64)>,
+    /// Song banks keyed by song number, for the on-demand load protocol.
+    /// Empty unless the set needs it (see [`rip_title`]).
+    pub bgm_banks: BTreeMap<u8, Vec<u8>>,
+    /// How many bank loads the driver requested (diagnostics).
+    pub bank_loads: u64,
 }
 
 impl Pc88Bus {
@@ -76,7 +89,31 @@ impl Pc88Bus {
             song: 0,
             sound_irq_masked: false,
             unknown_ports: BTreeMap::new(),
+            bgm_banks: BTreeMap::new(),
+            bank_loads: 0,
         }
+    }
+
+    /// Serve an on-demand song-bank load, hoot's `TYPE_GENERIC` port-0x00
+    /// protocol. Copies the requested bank to the destination the driver left
+    /// at `ram[0x5C..=0x5D]` and raises the load flag it then polls.
+    ///
+    /// Silently does nothing when the set declares no bank for `song`, matching
+    /// hoot's `bgm_flag[]` guard.
+    fn load_bank(&mut self, song: u8) {
+        let Some(bank) = self.bgm_banks.get(&song) else { return };
+        let dest = u16::from_le_bytes([self.mem[BANK_DEST_PTR], self.mem[BANK_DEST_PTR + 1]]) as usize;
+        // hoot copies a fixed 8 KB from a zero-padded slot; clamp to RAM.
+        let n = BGM_SIZE.min(0x10000usize.saturating_sub(dest));
+        if n == 0 {
+            return;
+        }
+        let copied = n.min(bank.len());
+        self.mem[dest..dest + copied].copy_from_slice(&bank[..copied]);
+        // The slot is zero-padded in hoot, so the tail must be cleared too.
+        self.mem[dest + copied..dest + n].fill(0);
+        self.mem[LOAD_FLAG] = 0xFF;
+        self.bank_loads += 1;
     }
 
     /// Synthesized VRTC bit for port 0x40 reads (bit 5): ~1.4 ms active per
@@ -125,7 +162,15 @@ impl Machine for Pc88Bus {
 
     fn port_out(&mut self, address: u16, value: u8) {
         match (address & 0xFF) as u8 {
-            0x00 => self.cmd = value,
+            0x00 => {
+                self.cmd = value;
+                // A driver that streams its song banks writes the song number
+                // here and waits for LOAD_FLAG. Only armed for sets that
+                // preload nothing, so sets that already work are untouched.
+                if !self.bgm_banks.is_empty() {
+                    self.load_bank(value);
+                }
+            }
             0x01 => self.param = value,
             // Sound-board IRQ mask (hoot mucom88: `ioport[0x32] & 0x80`).
             0x32 => self.sound_irq_masked = value & 0x80 != 0,
@@ -179,6 +224,8 @@ pub struct RipOutcome {
     pub irqs: (u64, u64),
     /// IM 2 vector-table entries for levels 0-7 at end of run (diagnostics).
     pub vectors: [u16; 8],
+    /// On-demand song-bank loads the driver requested over port 0x00.
+    pub bank_loads: u64,
 }
 
 /// Rip one title from a pc88 game: load, boot, trigger, run, log.
@@ -226,10 +273,8 @@ pub fn rip_title(
     // one. Sets without mdata_addr fall into two families: (a) placeholder
     // "DUMMY" bgm entries whose music actually lives in a code rom — nothing
     // to load; (b) drivers that copy the bank on demand when the song number
-    // is written to port 0x00 (hoot mucom88: memcpy to ram[0x5d:0x5c]).
-    // Family (b) is not yet emulated (needs the per-driver destination); such
-    // sets currently produce no writes rather than erroring. TODO: port-0x00
-    // bank-copy handler. See sweep findings in the project plan.
+    // is written to port 0x00. Family (b) is served by `Pc88Bus::load_bank`,
+    // armed below for exactly the sets that would otherwise preload nothing.
     // MUCOM88 (v1.5+) uses a different data/trigger model than the classic
     // PATCH: its compiled song data (`bgm`) is read by the driver's WORKINIT at
     // MU_TOP (0xC205), and its 127-byte patch triggers play with `CALL 0xEEA7`
@@ -250,6 +295,27 @@ pub fn rip_title(
                 bail!("{} does not fit at {:#x}", bgm.name, start);
             }
             bus.mem[start..start + data.len()].copy_from_slice(&data);
+        }
+    }
+
+    // Family (b): nothing was preloaded, so the driver must be one that asks
+    // for its bank over port 0x00. Hand the bus every bank the set declares,
+    // keyed by song number, and let `load_bank` serve the request. Arming this
+    // only when `bgm_addr` is None keeps sets that already rip well untouched.
+    if bgm_addr.is_none() {
+        for rom in &romlist.roms {
+            if rom.kind != "bgm" {
+                continue;
+            }
+            let Some(off) = rom.offset else { continue };
+            if !(0..=0xFF).contains(&off) {
+                continue;
+            }
+            // A missing or unreadable bank is not fatal: hoot simply has no
+            // flag set for it and ignores the request.
+            if let Ok(data) = read_set_file(set_dir, &rom.name) {
+                bus.bgm_banks.insert(off as u8, data);
+            }
         }
     }
 
@@ -336,7 +402,13 @@ pub fn rip_title(
         *v = bus.peek16(table);
     }
 
-    Ok(RipOutcome { log, unknown_ports: bus.unknown_ports.clone(), irqs, vectors })
+    Ok(RipOutcome {
+        log,
+        unknown_ports: bus.unknown_ports.clone(),
+        irqs,
+        vectors,
+        bank_loads: bus.bank_loads,
+    })
 }
 
 struct Runner<'a> {
@@ -445,4 +517,102 @@ fn read_set_file(dir: &std::path::Path, name: &str) -> Result<Vec<u8>> {
         }
     }
     bail!("file {name:?} not found in {}", dir.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bus_with_banks(banks: &[(u8, Vec<u8>)]) -> Pc88Bus {
+        let mut bus = Pc88Bus::new(PC88_OPN_CLOCK_HZ, PC88_CPU_HZ as u64);
+        for (n, d) in banks {
+            bus.bgm_banks.insert(*n, d.clone());
+        }
+        bus
+    }
+
+    /// The driver leaves its destination pointer at 0x5C/0x5D (little-endian).
+    fn set_dest(bus: &mut Pc88Bus, addr: u16) {
+        let [lo, hi] = addr.to_le_bytes();
+        bus.mem[BANK_DEST_PTR] = lo;
+        bus.mem[BANK_DEST_PTR + 1] = hi;
+    }
+
+    #[test]
+    fn bank_lands_at_the_drivers_pointer_and_raises_the_flag() {
+        let mut bus = bus_with_banks(&[(3, vec![0xAA; 64])]);
+        set_dest(&mut bus, 0x9000);
+        bus.load_bank(3);
+        assert_eq!(&bus.mem[0x9000..0x9040], &[0xAA; 64][..]);
+        assert_eq!(bus.mem[LOAD_FLAG], 0xFF);
+        assert_eq!(bus.bank_loads, 1);
+    }
+
+    #[test]
+    fn short_bank_is_zero_padded_to_the_slot_size() {
+        // hoot copies a fixed 8 KB out of a zero-filled slot, so stale bytes
+        // from a previous song must not survive past a shorter one.
+        let mut bus = bus_with_banks(&[(0, vec![0x11; 16])]);
+        set_dest(&mut bus, 0x8000);
+        bus.mem[0x8000 + 32] = 0xEE; // stale
+        bus.load_bank(0);
+        assert_eq!(bus.mem[0x8000], 0x11);
+        assert_eq!(bus.mem[0x8000 + 15], 0x11);
+        assert_eq!(bus.mem[0x8000 + 16], 0x00);
+        assert_eq!(bus.mem[0x8000 + 32], 0x00, "stale byte should be cleared");
+    }
+
+    #[test]
+    fn unknown_song_number_is_ignored() {
+        // hoot guards on bgm_flag[]; an unflagged request does nothing at all.
+        let mut bus = bus_with_banks(&[(1, vec![0xAA; 16])]);
+        set_dest(&mut bus, 0x9000);
+        bus.load_bank(7);
+        assert_eq!(bus.mem[0x9000], 0x00);
+        assert_eq!(bus.mem[LOAD_FLAG], 0x00);
+        assert_eq!(bus.bank_loads, 0);
+    }
+
+    #[test]
+    fn copy_is_clamped_to_the_top_of_ram() {
+        let mut bus = bus_with_banks(&[(2, vec![0x5A; BGM_SIZE])]);
+        set_dest(&mut bus, 0xFF00);
+        bus.load_bank(2); // 8 KB would run 0x1F00 bytes past the end
+        assert_eq!(bus.mem[0xFF00], 0x5A);
+        assert_eq!(bus.mem[0xFFFF], 0x5A);
+        assert_eq!(bus.bank_loads, 1);
+    }
+
+    #[test]
+    fn a_single_byte_window_still_loads() {
+        // The narrowest legal destination: one byte below the top of RAM.
+        let mut bus = bus_with_banks(&[(2, vec![0x5A; 32])]);
+        set_dest(&mut bus, 0xFFFF);
+        bus.load_bank(2);
+        assert_eq!(bus.mem[0xFFFF], 0x5A);
+        assert_eq!(bus.bank_loads, 1);
+    }
+
+    #[test]
+    fn port_00_write_requests_the_bank() {
+        let mut bus = bus_with_banks(&[(4, vec![0xC3; 8])]);
+        set_dest(&mut bus, 0xA000);
+        bus.port_out(0x00, 4);
+        assert_eq!(bus.mem[0xA000], 0xC3);
+        assert_eq!(bus.mem[LOAD_FLAG], 0xFF);
+        // The command port keeps its original meaning as well.
+        assert_eq!(bus.cmd, 4);
+    }
+
+    #[test]
+    fn port_00_is_inert_when_no_banks_are_armed() {
+        // Sets that preload their song must behave exactly as before.
+        let mut bus = bus_with_banks(&[]);
+        set_dest(&mut bus, 0xA000);
+        bus.mem[0xA000] = 0x42;
+        bus.port_out(0x00, 1);
+        assert_eq!(bus.mem[0xA000], 0x42, "memory must not be touched");
+        assert_eq!(bus.mem[LOAD_FLAG], 0x00);
+        assert_eq!(bus.cmd, 1);
+    }
 }
