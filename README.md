@@ -25,7 +25,9 @@ own legally obtained hoot archive.
 - **`hoot-machine` / PC-88** — Z80 + an OPN/OPNA bus front-end re-hosting hoot's
   PATCH bootstrap protocol (virtual trigger ports, IM 2 VRTC/clock/INT4 pacing,
   `use_rtc`/`use_vrtc`, IRQ ack/mask). CPU and OPN run as separate clock domains;
-  timing validated against hoot's own source. ~82% of PC-88 sets rip cleanly.
+  timing validated against hoot's own source. Sets whose data address the
+  catalogue omits are recovered by probing candidate addresses and keeping one
+  only if the capture is audible.
 - **`hoot-machine` / PC-98** — a genuine MS-DOS re-host on the vendored NP2 i286
   core: virtual DOS working directory, device-driver INIT, shell-command chain,
   and hoot's `externalCommand` (INT 7Eh/7Fh) song-trigger protocol. Handles OPN
