@@ -303,14 +303,46 @@ pub fn rip_title(
     let probe_secs = opts.seconds.min(PROBE_SECONDS);
     for &cand in DATA_ADDR_CANDIDATES {
         let probe = rip_title_at(game, set_dir, title_code, opts, Some(cand), probe_secs)?;
-        if !hoot_log::audibility(&probe.log).is_silent() {
-            let mut full =
-                rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)?;
-            full.bgm_addr_used = Some(cand);
-            return Ok(full);
+        if hoot_log::audibility(&probe.log).is_silent() {
+            continue;
         }
+        // Audible is not the same as correct. Loading the song at an address the
+        // driver does not read leaves it parsing whatever was already in RAM,
+        // and drivers will happily key notes off that -- verified on Tatesuka
+        // Wars, where forcing a wrong address yields a *larger* capture that the
+        // classifier calls audible but which is not the song.
+        //
+        // The tell is that such output does not depend on the title: the driver
+        // reads the same stale memory whichever song was selected. So require a
+        // second, different title to produce a different stream before trusting
+        // the address.
+        if let Some(other) = other_title_code(game, title_code) {
+            let probe2 = rip_title_at(game, set_dir, other, opts, Some(cand), probe_secs)?;
+            if same_stream(&probe.log, &probe2.log) {
+                continue;
+            }
+        }
+        let mut full = rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)?;
+        full.bgm_addr_used = Some(cand);
+        return Ok(full);
     }
     Ok(plain)
+}
+
+/// Any title of `game` whose code differs from `title_code`, for the
+/// distinctness check above. `None` when the set has only one distinct title,
+/// where the check cannot say anything.
+fn other_title_code(game: &Game, title_code: u64) -> Option<u64> {
+    game.expanded_titles().into_iter().map(|t| t.code).find(|&c| c != title_code)
+}
+
+/// Do two logs contain the same register writes, ignoring timing?
+fn same_stream(a: &RegisterLog, b: &RegisterLog) -> bool {
+    a.writes.len() == b.writes.len()
+        && a.writes
+            .iter()
+            .zip(b.writes.iter())
+            .all(|(x, y)| (x.port, x.addr, x.data) == (y.port, y.addr, y.data))
 }
 
 /// One pass of the machine with an explicit bgm load address and run length.
@@ -373,11 +405,16 @@ fn rip_title_at(
         }
     }
 
-    // Family (b): nothing was preloaded, so the driver must be one that asks
-    // for its bank over port 0x00. Hand the bus every bank the set declares,
-    // keyed by song number, and let `load_bank` serve the request. Arming this
-    // only when `bgm_addr` is None keeps sets that already rip well untouched.
-    if bgm_addr.is_none() {
+    // Family (b): the driver asks for its bank over port 0x00 rather than
+    // finding it preloaded. Hand the bus every bank the set declares, keyed by
+    // song number, and let `load_bank` serve the request.
+    //
+    // Armed when nothing was preloaded, AND for MUCOM regardless: hoot's
+    // `Mucom88Driver` (TYPE_GENERIC) keeps its bgm in a side buffer and serves
+    // port 0x00 from it, so a MUCOM set can want the bank on demand even though
+    // we also seed MU_TOP. Gating solely on `bgm_addr.is_none()` made this path
+    // unreachable for the one family hoot documents as using it.
+    if bgm_addr.is_none() || is_mucom {
         for rom in &romlist.roms {
             if rom.kind != "bgm" {
                 continue;
@@ -690,5 +727,50 @@ mod tests {
         assert_eq!(bus.mem[0xA000], 0x42, "memory must not be touched");
         assert_eq!(bus.mem[LOAD_FLAG], 0x00);
         assert_eq!(bus.cmd, 1);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use hoot_log::{Chip, Device};
+
+    fn log(writes: &[(u8, u8, u8)]) -> RegisterLog {
+        let mut l = RegisterLog::new(
+            1_000_000,
+            vec![Device { chip: Chip::Ym2203, clock_hz: PC88_OPN_CLOCK_HZ }],
+        );
+        for (i, &(port, addr, data)) in writes.iter().enumerate() {
+            l.push(RegWrite { t: i as u64 * 100, dev: 0, port, addr, data });
+        }
+        l
+    }
+
+    #[test]
+    fn same_stream_ignores_timing() {
+        let a = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x20)]);
+        let mut b = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x20)]);
+        // shift every timestamp; the register stream is unchanged
+        for w in b.writes.iter_mut() {
+            w.t += 12_345;
+        }
+        assert!(same_stream(&a, &b));
+    }
+
+    #[test]
+    fn same_stream_detects_different_music() {
+        let a = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x20)]);
+        let b = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x21)]);
+        assert!(!same_stream(&a, &b));
+        assert!(!same_stream(&a, &log(&[(0, 0x28, 0xF0)])));
+    }
+
+    #[test]
+    fn same_stream_holds_for_identical_logs() {
+        // The stale-RAM case: a wrong address gives byte-for-byte the same
+        // stream whichever title was selected, which is what the guard rejects.
+        let a = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x20), (0, 0x28, 0x00)]);
+        let b = log(&[(0, 0x28, 0xF0), (0, 0x40, 0x20), (0, 0x28, 0x00)]);
+        assert!(same_stream(&a, &b));
     }
 }

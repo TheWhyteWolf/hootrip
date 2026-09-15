@@ -1036,7 +1036,10 @@ fn rip(
             .unwrap_or_else(|| "NEC PC-8801".into());
         let base = format!("{:02} {}", i, sanitize(&t.name));
 
-        let wrote = if n_writes > 0 {
+        // Same gate as archive-rip: a capture that cannot make a sound is not
+        // written. Reported per title so a skip is never mysterious.
+        let class = hoot_log::audibility(&outcome.log);
+        let wrote = if !class.is_silent() {
             if format == "s98" || format == "both" {
                 let mut tags = S98Tags::default();
                 tags.set("title", &t.name);
@@ -1057,7 +1060,7 @@ fn rip(
             }
             "ok"
         } else {
-            "NO WRITES"
+            class.tag()
         };
         println!(
             "  [{i:02}] {:<40} {:>7} writes  rtc/opn irqs {}/{}  {}",

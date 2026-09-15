@@ -179,14 +179,16 @@ impl Markers {
 
     /// Classify accumulated markers.
     pub fn classify(self) -> Audibility {
-        if self.key_on == 0 && self.ssg_tone == 0 && self.rhythm == 0 {
-            if self.adpcm > 0 {
-                Audibility::AdpcmOnly
-            } else {
-                Audibility::Dead
-            }
-        } else if self.voiced == 0 && self.ssg_tone == 0 && self.rhythm == 0 {
-            Audibility::NoVoice
+        // Neither SSG nor rhythm is contributing; the verdict rests on FM.
+        let no_tonal = self.ssg_tone == 0 && self.rhythm == 0;
+        if no_tonal && self.key_on == 0 {
+            if self.adpcm > 0 { Audibility::AdpcmOnly } else { Audibility::Dead }
+        } else if no_tonal && self.voiced == 0 {
+            // Key-ons but no voice ever programmed. If the only content that
+            // could make a sound is ADPCM, name it as such: a driver that keys
+            // silent FM channels alongside its ADPCM is still an ADPCM track,
+            // and calling it NoVoice hides that from the census.
+            if self.adpcm > 0 { Audibility::AdpcmOnly } else { Audibility::NoVoice }
         } else {
             Audibility::Audible
         }
@@ -369,6 +371,16 @@ mod tests {
         let log = log_with(Chip::Ym2608, &[(1, 0x00, 0x80), (1, 0x01, 0x00), (1, 0x10, 0x80)]);
         assert_eq!(audibility(&log), Audibility::AdpcmOnly);
         assert!(Audibility::AdpcmOnly.is_silent());
+    }
+
+    #[test]
+    fn adpcm_with_silent_keyons_is_still_adpcm() {
+        // Observed on The Scheme (OPNA): keyon=240 alongside adpcm=726, with no
+        // voice ever programmed. Previously reported as NoVoice, hiding the
+        // ADPCM content from the census. Both classes drop the track, so this
+        // is about the label being truthful.
+        let log = log_with(Chip::Ym2608, &[(1, 0x00, 0x80), (0, 0x40, 0x7F), (0, 0x28, 0xF0)]);
+        assert_eq!(audibility(&log), Audibility::AdpcmOnly);
     }
 
     #[test]
