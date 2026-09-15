@@ -1121,6 +1121,9 @@ struct SetSummary {
     /// Titles dropped because their only content is ADPCM, which neither
     /// writer can currently represent (a format gap, not a failed rip).
     adpcm_titles: usize,
+    /// Titles that failed outright (e.g. a rom the catalogue names is not in
+    /// the set). One bad title no longer abandons the rest of the set.
+    error_titles: usize,
     stop_skipped: usize,
     writes: usize,
     keyons: usize,
@@ -1132,7 +1135,7 @@ impl SetSummary {
     fn to_json(&self) -> String {
         format!(
             "{{\"ordinal\":{},\"platform\":\"{}\",\"kind\":\"{}\",\"name\":\"{}\",\"archive\":\"{}\",\
-\"status\":\"{}\",\"titles\":{},\"ripped\":{},\"silent\":{},\"novoice\":{},\"adpcm\":{},\"stop_skipped\":{},\"writes\":{},\
+\"status\":\"{}\",\"titles\":{},\"ripped\":{},\"silent\":{},\"novoice\":{},\"adpcm\":{},\"title_errors\":{},\"stop_skipped\":{},\"writes\":{},\
 \"keyons\":{},\"looped\":{},\"err\":\"{}\"}}",
             self.ordinal,
             json_escape(&self.platform),
@@ -1145,6 +1148,7 @@ impl SetSummary {
             self.silent_titles,
             self.novoice_titles,
             self.adpcm_titles,
+            self.error_titles,
             self.stop_skipped,
             self.writes,
             self.keyons,
@@ -1244,12 +1248,15 @@ fn finalize_status(sum: &mut SetSummary, any_timeout: bool) {
             "timeout"
         } else if effective == 0 {
             "stoponly"
+        } else if sum.error_titles > 0 {
+            "error"
         } else {
             "silent"
         }
     } else if sum.silent_titles > 0
         || sum.novoice_titles > 0
         || sum.adpcm_titles > 0
+        || sum.error_titles > 0
         || any_timeout
     {
         "partial"
@@ -1289,6 +1296,7 @@ fn rip_one_set(
             silent_titles: 0,
             novoice_titles: 0,
             adpcm_titles: 0,
+            error_titles: 0,
             stop_skipped: 0,
             writes: 0,
             keyons: 0,
@@ -1309,6 +1317,7 @@ fn rip_one_set(
         silent_titles: 0,
         novoice_titles: 0,
         adpcm_titles: 0,
+        error_titles: 0,
         stop_skipped: 0,
         writes: 0,
         keyons: 0,
@@ -1380,8 +1389,14 @@ fn rip_one_set(
                 let mut outcome = match hoot_machine::pc98::rip_title(g, &set_dir, t.code, &opts) {
                     Ok(o) => o,
                     Err(e) => {
-                        sum.err = e.to_string();
-                        break;
+                        // A rom the catalogue names may simply not be in the
+                        // set -- the archive is not always complete. Skip that
+                        // title rather than abandoning every one after it.
+                        if sum.err.is_empty() {
+                            sum.err = e.to_string();
+                        }
+                        sum.error_titles += 1;
+                        continue;
                     }
                 };
                 if outcome.timed_out {
@@ -1441,8 +1456,14 @@ fn rip_one_set(
                 let mut outcome = match hoot_machine::rip_title(g, &set_dir, t.code, &opts) {
                     Ok(o) => o,
                     Err(e) => {
-                        sum.err = e.to_string();
-                        break;
+                        // A rom the catalogue names may simply not be in the
+                        // set -- the archive is not always complete. Skip that
+                        // title rather than abandoning every one after it.
+                        if sum.err.is_empty() {
+                            sum.err = e.to_string();
+                        }
+                        sum.error_titles += 1;
+                        continue;
                     }
                 };
                 apply_out(&mut outcome.log);
@@ -1542,6 +1563,7 @@ fn synth_json(t: &Tgt, status: &str, err: &str) -> String {
         silent_titles: 0,
         novoice_titles: 0,
         adpcm_titles: 0,
+        error_titles: 0,
         stop_skipped: 0,
         writes: 0,
         keyons: 0,
@@ -1715,10 +1737,15 @@ fn archive_rip(
                 break;
             }
             let t = &targets[idx];
-            // Per-set wall budget: room for every song to hit its spin-guard,
-            // capped by the absolute ceiling so a hung set can't stall a worker.
-            // +30s covers driver setup and the child's own startup.
-            let grace_secs = ((t.titles as f64) * title_deadline + 30.0).min(timeout);
+            // Per-set wall budget: room for every song to hit its spin-guard
+            // AND for the per-song setup around it, capped by the absolute
+            // ceiling so a hung set can't stall a worker. The margin matters:
+            // with a bare `titles * deadline` the budget exactly equals the
+            // worst case, so a set whose songs all spin (e.g. Mercury, 50
+            // titles at clockmul=8) is killed just short of reporting, and
+            // lands in the census as an unexplained `timeout` with no titles.
+            let grace_secs =
+                ((t.titles as f64) * (title_deadline + 10.0) + 60.0).min(timeout);
             let grace = std::time::Duration::from_secs_f64(grace_secs + 15.0);
             let mut cmd = Command::new(&exe);
             cmd.arg("--archive")
