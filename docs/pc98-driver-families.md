@@ -252,9 +252,21 @@ state and then failing to play:
   **0.711s of a 5s capture**
 
 So the driver installs, hooks its timer and ticks, then stops. The song data
-never drives it. Note also `clockmul = 8`, so an MML compile costs real emulated
-time; whether the trigger fires before compilation completes has not been
-established.
+never drives it.
+
+**The obvious hypothesis is wrong.** `clockmul = 8` means an MML compile costs
+real emulated time, so the trigger firing before compilation finishes looked
+likely. It is not: raising `--setup-seconds` from 3 to 10 to 25 changes nothing
+at all — 368 FM writes, 103 captured, 3 key-ons, span 0.000–0.711s, byte for
+byte identical every time. Whatever stops this family is deterministic and
+happens early, not a race with setup.
+
+That points at the trigger itself rather than timing. Songs here are bound as
+`file` roms on handles `0x0b`–`0x1b` and the title code *is* the handle number,
+which is unlike the families in §2 where the song is presented on handle 0. The
+next step is to disassemble `music_98.com`'s INT 7Fh handler and establish what
+it actually reads — which port it takes the song number from, and which handle it
+opens — rather than assuming it follows the handle-0 convention.
 
 The diagnostic to start from:
 
