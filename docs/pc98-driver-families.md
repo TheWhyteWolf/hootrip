@@ -251,10 +251,41 @@ state and then failing to play:
 - but only **3 key-ons**, and every register write falls inside the first
   **0.711s of a 5s capture**
 
-So the driver installs, hooks its timer and ticks, then stops. The song data
-never drives it.
+**Resolved.** The driver was fine; the harness was delivering its interrupts to
+the wrong vector.
 
-**The obvious hypothesis is wrong.** `clockmul = 8` means an MML compile costs
+`music_98` puts its sequencer ISR on **INT 14h** (IRQ12 — the PC-98 sound
+board's interrupt jumper can route the OPN `/IRQ` there instead of IRQ3, and
+this harness already forces the jumper bits that select it). But it *also* hooks
+INT 0Ah, and `opn_sound_vec()` fell through to its positional fallback — "lowest
+hooked hardware vector" — which picked 0x0A. Every OPN timer IRQ was delivered
+there, landed on the DOS trampoline with no handler, and the sequencer never
+advanced.
+
+`0x14` now sits alongside `0x0B` as a vector a driver names outright, preferred
+over the positional guess. On `bakasuka_98`:
+
+| | before | after |
+|---|---|---|
+| sound vector | 0x0A | **0x14** |
+| timer IRQs | 259 | 561 |
+| FM writes | 368 | 2,869 |
+| key-ons | 3 | **149** |
+| write span | 0.000–0.711s | **0.000–4.969s** of 5s |
+
+The set rips 34/34 audible, all distinct, from zero.
+
+**Across the corpus:** re-ripping the 295 previously-silent pc98dos archives
+recovers **57 sets and 1,634 tracks**. A control of 72 sets that already ripped
+cleanly shows **zero regressions** (70 identical, 2 improved).
+
+The paragraphs below record how the failure presented, since the same shape —
+driver resident and ticking, but almost no key-ons and a write span far shorter
+than the capture — is the signature of a misrouted sound vector.
+
+
+**The obvious hypothesis was wrong,** and ruling it out is what pointed at the
+vector. `clockmul = 8` means an MML compile costs
 real emulated time, so the trigger firing before compilation finishes looked
 likely. It is not: raising `--setup-seconds` from 3 to 10 to 25 changes nothing
 at all — 368 FM writes, 103 captured, 3 key-ons, span 0.000–0.711s, byte for

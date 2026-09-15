@@ -60,6 +60,12 @@ const PC98_OPN_IRQ_VEC: u8 = 0x0B;
 /// paced sound engines (A-Train's ARTDI, VSYNCMAN) hook it and advance one
 /// sequencer tick per vertical retrace.
 const PC98_VSYNC_VEC: u8 = 0x0A;
+/// PC-98 IRQ12 real-mode vector. The sound board's interrupt jumper can route
+/// the OPN(A) `/IRQ` here instead of IRQ3, and the board setup in this harness
+/// forces the jumper bits that select it (see the INT 0x14 segment word at
+/// 0000:0052), so a driver hooking 0x14 is naming its sound ISR just as
+/// explicitly as one hooking 0x0B.
+const PC98_SOUND_IRQ12_VEC: u8 = 0x14;
 /// Device-driver INIT scratch, all in the free low RAM between the trampoline
 /// table (ends linear 0x800) and the arena (0x10000), disjoint from the capture
 /// idle stub at [`IDLE_SEG`]. Live only for the duration of the INIT far calls.
@@ -297,12 +303,21 @@ impl Engine<'_> {
             return self.forced_vec;
         }
         // The PC-98 sound board's OPN(A) /IRQ is wired to IRQ3 → INT 0x0B, where
-        // the paced drivers (PMD, FMP3, MMD2, …) put their sequencer ISR. A
-        // driver may ALSO hook a lower vector (e.g. IRQ2/INT 0x0A) for a
-        // secondary counter, so prefer the canonical OPN vector when hooked
-        // before falling back to the lowest hooked hardware-IRQ vector.
-        if Some(PC98_OPN_IRQ_VEC) != self.funcvect && self.hooked(PC98_OPN_IRQ_VEC) {
-            return Some(PC98_OPN_IRQ_VEC);
+        // the paced drivers (PMD, FMP3, MMD2, …) put their sequencer ISR, or to
+        // IRQ12 → INT 0x14 when the board's interrupt jumper selects it. Both
+        // are the driver naming its sound ISR outright, so prefer either over
+        // the positional fallback below.
+        //
+        // The fallback -- lowest hooked hardware vector -- is a guess, and it
+        // guesses wrong whenever a driver hooks something lower for an unrelated
+        // purpose. `music_98` is the case that exposed it: the driver puts its
+        // sequencer at 0x14 but also hooks 0x0A, so every OPN timer IRQ was
+        // delivered to 0x0A, landed on the DOS trampoline with no handler, and
+        // the music never advanced -- 259 ticks, three key-ons, then silence.
+        for cand in [PC98_OPN_IRQ_VEC, PC98_SOUND_IRQ12_VEC] {
+            if Some(cand) != self.funcvect && self.hooked(cand) {
+                return Some(cand);
+            }
         }
         for v in 0x08u8..=0x1F {
             if Some(v) == self.funcvect || v == PC98_TIMER_VEC {
