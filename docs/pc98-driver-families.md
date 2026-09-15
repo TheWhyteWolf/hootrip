@@ -199,3 +199,69 @@ was entirely this artifact.
 - **Charm 2's MDDRV_98** variant: some indices deliver 0 IRQs (timer/vector quirk).
 - **Family B "Night Seep"** (VSYNCMAN + SNDDRV2): the VSYNC infra is in place, but
   VSYNCMAN's frame-callback chain and song delivery need wiring.
+
+---
+
+## 4. The remaining silent sets — a ranked queue
+
+After the audibility gate landed (see [silent-rips](silent-rips.html)), the sets
+that produce *nothing* are countable rather than hidden in a pile of silent
+files. Measured over a full rip of HootArchive20240621:
+
+**393 OPN-family sets are entirely silent, holding 8,766 titles** — 310 pc98dos
+sets (6,676 titles) and 83 pc88 (2,090). MIDI/GS/MT-32 variants are excluded;
+those are silent by construction and are not failures.
+
+Grouped by the **last shell command** — the hoot glue stub that installs the
+INT 7Eh/7Fh trigger — the pc98dos half is a long tail of driver families, not
+one bug:
+
+| titles | sets | stub |
+|---:|---:|---|
+| 808 | 29 | `music_98` |
+| 480 | 28 | `fgplay_h` |
+| 474 | 13 | `pmd_98` |
+| 398 | 11 | `valky_98` |
+| 230 | 11 | `nlp_hoot` |
+| 218 | 12 | `emd_98` |
+| 216 | 14 | `fmxp` |
+| 208 | 7 | `usmd` |
+| 208 | 12 | `usd_98` |
+| 185 | 12 | `magic_98` |
+| 156 | 10 | `cplay98` |
+| 151 | 4 | `odq_98` |
+
+`pmd_98` and `cplay98` appearing here is worth noting: both families are
+supported, so those are per-set failures within a working family rather than a
+missing family.
+
+### What `music_98` does (the largest cluster)
+
+Chain is `MUSIC.COM -r` (driver, goes resident) then `music_98.com` (hoot's
+stub, installs INT 7Fh). Songs are **MML source**, bound as `type="file"` roms on
+DOS handles `0x0b`–`0x1b`, and the title code is the handle number — so
+`MUSIC.COM` is compiling MML at run time rather than loading compiled data.
+
+Tracing `bakasuka_98` (34 titles) shows the driver reaching a healthy resident
+state and then failing to play:
+
+- console confirms residency (`音楽ドライバー Ver 1.00 … メモリーに常駐しました`)
+- INT 7Fh is installed by the stub (`INT 0x7f -> 0x2002:0x014c`)
+- the OPN timer runs — 259 timer IRQs over the capture
+- but only **3 key-ons**, and every register write falls inside the first
+  **0.711s of a 5s capture**
+
+So the driver installs, hooks its timer and ticks, then stops. The song data
+never drives it. Note also `clockmul = 8`, so an MML compile costs real emulated
+time; whether the trigger fires before compilation completes has not been
+established.
+
+The diagnostic to start from:
+
+```sh
+hootrip --archive <archive> pc98 "Bakasuka Wars (OPN)" --index 0
+```
+
+which prints the interrupt vector table, timer state, write span, key-on count,
+the MCB chain, unimplemented DOS/INT calls, and the guest's console output.
+
