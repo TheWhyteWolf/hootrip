@@ -308,3 +308,83 @@ hootrip --archive <archive> pc98 "Bakasuka Wars (OPN)" --index 0
 which prints the interrupt vector table, timer state, write span, key-on count,
 the MCB chain, unimplemented DOS/INT calls, and the guest's console output.
 
+---
+
+## 5. Plan for the sets that are still silent
+
+After the INT 14h fix, **75 sets / 2,084 tracks** recovered and **268 sets /
+5,518 titles** remain silent (MIDI/GS variants excluded — those are not
+failures). Running the `pc98` diagnostic on a representative of each large
+cluster sorts them into **five failure signatures**, and the signature, not the
+driver name, is what determines the work.
+
+Beware when building these lists: `--only-archives` selects by archive folder,
+and the OPN and GS variants of a game share one. An unfiltered list pulls in GS
+sets that were never candidates and makes the remaining pile look larger and
+more driver-diverse than it is.
+
+### A. Unimplemented driver API interrupt — ~710 titles
+
+The stub installs, then the driver calls an interrupt the harness does not
+service and either spins or gives up. Nothing is hooked, no timer runs, no
+register is written.
+
+| cluster | titles | evidence |
+|---|---:|---|
+| `fgplay_h` | 480 | `INT 0xd2 AH=0x00` **×1,142,859** — a spin |
+| `nlp_hoot` | 230 | `INT 0x60 AH=0x01/0x02`, plus DOS `AH=47h` |
+
+Most tractable of the five: the call is named, the count is unambiguous, and
+INT D2h already has a partial implementation for the MDRV family. Start here.
+
+### B. Pacing source hooked but not running — ~398 titles
+
+`valky_98` hooks INT 08h (PIT), 0x0B, 0x50 and 0xB0, but `opn timer used:
+false` and exactly **1** timer IRQ arrives. The driver is PIT-paced and the PIT
+is not ticking, so the sequencer advances once and stops. Look at PIT
+programming and the IRQ0 unmask path rather than at the driver.
+
+### C. Activity falls outside the capture window — ~218 titles
+
+`emd_98` is alive: **479 timer IRQs and 842 FM writes**. But only **1 write is
+captured**, the span is 0.000–0.010s of a 5s capture, and there are no key-ons.
+The driver ran during setup and was finished before recording began. This is a
+trigger/capture-ordering question, not an emulation gap.
+
+### D. Voice data never loaded — ~426 titles
+
+`pmd_98` (the 10 sets the INT 14h change did not fix) reaches **1,408 timer
+IRQs, 33 key-ons and a 4.693s write span** — it is sequencing real music — yet
+classifies as `NoVoice`, meaning no operator TL was ever programmed below
+maximum attenuation. Notes are being played on instruments that were never
+defined. The timbre/voice file is not reaching the driver.
+
+That this family is *partially* fixed matters: the same stub works elsewhere, so
+the difference is per-set, most likely in how the voice file is bound.
+
+### E. Everything else — the tail
+
+`usmd`, `usd_98`, `magic_98`, `cplay98`, `odq_98` and friends, 150–210 titles
+each. Worth re-running the diagnostic across all of them and bucketing by
+signature before touching any code — on this evidence the buckets will not
+follow the driver names.
+
+### Suggested order
+
+1. **A** (~710 titles) — named missing calls, clearest fix.
+2. **D** (~426) — a working family failing on a subset; the delta should be findable.
+3. **C** (~218) — ordering, likely cheap once understood.
+4. **B** (~398) — PIT work, more invasive.
+5. **E** — re-diagnose and re-bucket first.
+
+### The diagnostic
+
+```sh
+hootrip --archive <archive> pc98 "<game>" --index 0
+```
+
+Read in this order: which vectors got hooked, `sound vector`, `timer IRQs`,
+`FM writes` (total vs captured), `key on/off`, `write span`, then the
+unimplemented-call tally and the guest's console output. The five signatures
+above are each visible in those lines alone.
+
