@@ -512,3 +512,28 @@ the output is what surfaced the `pc98-rip` gate gap recorded in
 
 For the `fgplay_h` sets, 20 tracks sampled across 5 of the 27 peak at −6 to
 −19 dBFS with none silent.
+
+**Control: 70 previously-working sets, one from each of ~50 stub families, all
+14 titles or fewer, re-ripped in full and compared against the promoted library
+on the dump-region identity `hootrip triage` records.** 688 tracks, 100%
+audible, **609 byte-identical**. The 79 that differ fall in 7 sets:
+
+| set | delta | what changed |
+|---|---:|---|
+| AD&D Dragon Strike (OPN) | +0.063% | the intended `dummysndrom` init (`00 07 bf` now leads the stream) |
+| ESP, Ekudorado (86), Kara no Naka no Kotori, Poison Needle (OPNA), Ryuou Sangokushi, Touhou Reiiden (OPNA) | ≤0.005% | one-tick wait rounding |
+
+The rounding is a 1 ms `0xFF`/`0xFE` wait landing on the other side of a
+register write — `00 28 f5 FF 00 a4 0c` where the library has
+`00 28 f5 00 a4 0c FF`, or `FE 0a FE 0b` where it has `FE 0b FE 0a`. Same
+events, same order, same total elapsed time; the environment block moves every
+PSP three paragraphs, which shifts the setup phase by a few cycles. Durations
+are identical and peaks match within 0.4 dB throughout.
+
+**A trap in reading that comparison.** Three library folders hold tracks from
+more than one catalogue entry, because distinct archives render to the same
+display name: `dang_98` (8 titles) and `dang2_98` (39) both write to
+`[PC-9801] Hana Yori Dango 2 (OPN)`, and `fm_variant_game_name` maps a set's
+GS/MT-32 entries onto its `(OPN)` folder as well. A control that rips one entry
+and diffs the folder reports the other entry's tracks as missing. That is the
+79 "missing" in this run, and it is not a rip failure.
