@@ -32,7 +32,8 @@ use hoot_log::{Chip, Device, RegWrite, RegisterLog};
 use hoot_xml::{parse_num, Game, RomList};
 
 use super::dos::{
-    BiosTimerReq, ExecResult, MiniDos, ProgKind, ARENA_END, CALL_RET_OFF, TRAMP_SEG,
+    BiosTimerReq, ExecResult, MiniDos, ProgKind, ARENA_END, BIOS_DUMMY_SEG, CALL_RET_OFF,
+    TRAMP_SEG,
 };
 use super::io::Pc98Io;
 
@@ -322,7 +323,7 @@ impl Engine<'_> {
     /// True if `vec` is hooked (points somewhere other than the trampoline).
     fn hooked(&self, vec: u8) -> bool {
         let (seg, _) = self.ivt(vec);
-        seg != TRAMP_SEG && seg != 0
+        seg != TRAMP_SEG && seg != BIOS_DUMMY_SEG && seg != 0
     }
 
     /// The vector the OPN timer IRQ is delivered on: the forced one, else the
@@ -981,7 +982,7 @@ pub fn rip_title(
     let mut hooked_vectors = BTreeMap::new();
     for v in 0u16..256 {
         let (seg, off) = eng.ivt(v as u8);
-        if seg != TRAMP_SEG && seg != 0 {
+        if seg != TRAMP_SEG && seg != BIOS_DUMMY_SEG && seg != 0 {
             hooked_vectors.insert(v as u8, (seg, off));
         }
     }
@@ -1200,6 +1201,11 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     // the pack content (bind_rom_handles), nothing goes on handle 0. Self-identify
     // by a `.PAC` file rom at offset == byte 1.
     let byte1 = ((title_code >> 8) & 0xFF) as u16;
+    // MAGIC_98 (`magic_98` stub + MUSIC_.EXE) reads a timbre file from the DOS
+    // handle in title byte 1 before playing the song in the low byte. Scoped to
+    // the stub: the "a file rom sits at offset byte1" shape alone is true of 83
+    // sets across six other families, most of which already play.
+    let magic_voice = byte1 != 0 && byte2 == 0 && shell_starts(&["magic_98"]);
     let packed = byte1 != 0
         && romlist.roms.iter().any(|r| {
             r.kind == "file"
@@ -1212,6 +1218,15 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     } else if mdr_voice {
         eng.io.ext_song = 0;
         eng.io.ext_param = byte2; // byte 2 → 0x7E4 = voice-file DOS handle
+    } else if magic_voice {
+        // MAGIC_98: one word carries both handles — its INT 7Fh handler reads
+        // 0x7E2 as AX, and `or ah,ah / jz` skips the timbre load entirely when
+        // the high byte is zero. AH is then lseek'd and read as the timbre file
+        // (driver call 3, "load timbre") before AL is played as the song. Left
+        // with the low byte alone the driver stays resident and prints
+        // 「音色が指定されていません」 — no timbre specified — and never sounds.
+        eng.io.ext_song = (title_code & 0xFFFF) as u16; // 0x7E2: high=timbre handle, low=song
+        eng.io.ext_param = 0;
     } else if packed {
         eng.io.ext_song = (title_code & 0xFFFF) as u16; // 0x7E2: high=pack handle, low=index
         eng.io.ext_param = 0;
@@ -1247,7 +1262,11 @@ fn preset_muse_irq_jumper(eng: &mut Engine, romlist: &RomList) {
             n.starts_with("musdrv") || n.starts_with("mbmusp")
         }
     });
-    if mbmusp {
+    let fplay = romlist
+        .roms
+        .iter()
+        .any(|r| r.kind == "shell" && r.name.to_ascii_lowercase().starts_with("fplay"));
+    if mbmusp || fplay {
         eng.io.opn.set_ssg_readback(0x0E, 0xC0);
     }
 }

@@ -30,6 +30,38 @@ use hoot_cpu::{Reg16, X86Cpu};
 /// a real handler; at any other segment such a driver wrongly concludes it is
 /// already installed and takes its uninstall path (e.g. MUSIC.COM's `music -r`).
 pub const TRAMP_SEG: u16 = 0x0060;
+
+/// Segment a PC-98 leaves *unclaimed* interrupt vectors pointing at: the BIOS's
+/// dummy `IRET`. Drivers use it as the "is anybody home?" test — MAGIC_98 asks
+/// DOS for INT EFh, compares the segment against 0xFFF0, and only falls through
+/// to its real vector (INT 6Dh) when it sees the BIOS there. Pointing every
+/// vector at our own trampoline segment answers "yes, EFh is taken" to every
+/// such probe, and the caller then talks to a vector nobody serves.
+///
+/// So vectors [`MiniDos::service_int`] actually implements keep their
+/// [`TRAMP_SEG`] trampoline, and the rest point here — still trapped (the
+/// harness recognises the segment and keeps counting unimplemented calls), but
+/// reading back as the free vector it is. One byte per vector is enough: the
+/// harness performs the `IRET` itself rather than executing one.
+pub const BIOS_DUMMY_SEG: u16 = 0xFFF0;
+
+/// First vector in the PC-98's *free* interrupt range. 00h-5Fh belong to the
+/// BIOS and DOS — INT 18h keyboard, INT 1Ch timer, INT 21h DOS, and a crowd of
+/// others — and even the ones nothing uses point into DOS rather than at the
+/// BIOS dummy. Drivers install their APIs from 60h up (PMD on 60h, MDRV and EMD
+/// on D2h, MAGIC on 6Dh/EFh), and that is the range where "unclaimed" means
+/// 0xFFF0.
+///
+/// The split is load-bearing in both directions. MAGIC_98 reads INT EFh and
+/// wants 0xFFF0 before it will look at its real vector; MUSIC.COM reads INT 48h
+/// and treats [`TRAMP_SEG`] as the free marker — pointing 48h at the BIOS dummy
+/// makes it match INT 0Ah's segment, which it reads as "a copy of me is already
+/// resident", so it prints a message and exits. 29 sets went silent that way.
+const FREE_VECTOR_BASE: u8 = 0x60;
+
+/// Vectors [`MiniDos::service_int`] implements, and so the ones that must look
+/// claimed in the IVT even inside the free range.
+const SERVICED_VECTORS: &[u8] = &[0x18, 0x1C, 0x20, 0x21, 0x27];
 /// Offset within [`TRAMP_SEG`] of the sentinel a harness-initiated far call
 /// returns to: a single `HLT` placed just past the 512-byte trampoline table
 /// (linear 0x800), so it is never mistaken for an interrupt-vector trap
@@ -232,21 +264,35 @@ impl MiniDos {
     /// interrupts trap to the harness until a program installs its own handler.
     pub fn install_trampolines(&self, mem: &mut [u8]) {
         let base = lin(TRAMP_SEG, 0);
+        let dummy = lin(BIOS_DUMMY_SEG, 0);
         for v in 0..256usize {
             wr8(mem, base + v * 2, HLT);
             wr8(mem, base + v * 2 + 1, IRET);
-            // IVT[v] = TRAMP_SEG:(v*2)
-            wr16(mem, v * 4, (v * 2) as u16);
-            wr16(mem, v * 4 + 2, TRAMP_SEG);
+            // The dummy handlers sit at the *bottom* of segment 0xFFF0, so the
+            // top of the ROM — the CPU reset vector and machine ID at
+            // 0xFFFF0 — is left alone.
+            let free = v >= FREE_VECTOR_BASE as usize && !SERVICED_VECTORS.contains(&(v as u8));
+            let (seg, off) = match free {
+                true => {
+                    let off = v - FREE_VECTOR_BASE as usize;
+                    wr8(mem, dummy + off, HLT);
+                    (BIOS_DUMMY_SEG, off as u16)
+                }
+                false => (TRAMP_SEG, (v * 2) as u16),
+            };
+            wr16(mem, v * 4, off);
+            wr16(mem, v * 4 + 2, seg);
         }
     }
 
     /// If CS:IP sits on a trampoline `HLT`, return the interrupt vector it fronts.
     pub fn trap_vector(&self, cs: u16, ip: u16) -> Option<u8> {
-        if cs == TRAMP_SEG && ip < 512 && ip % 2 == 0 {
-            Some((ip / 2) as u8)
-        } else {
-            None
+        match cs {
+            TRAMP_SEG if ip < 512 && ip % 2 == 0 => Some((ip / 2) as u8),
+            BIOS_DUMMY_SEG if ip < (256 - FREE_VECTOR_BASE as u16) => {
+                Some(ip as u8 + FREE_VECTOR_BASE)
+            }
+            _ => None,
         }
     }
 
@@ -1346,6 +1392,38 @@ mod tests {
     /// reads handle 7, misses the error, hands the garbage to its driver and
     /// dies before installing its INT 7Fh vector. Handles 0-4 are the ones DOS
     /// always has open, and an empty read of those is legitimate.
+    /// A PC-98 leaves unclaimed vectors pointing at the BIOS dummy in segment
+    /// 0xFFF0, and drivers read that back to find a vector nobody owns.
+    /// MAGIC_98 asks for INT EFh, sees our trampoline segment instead of the
+    /// BIOS, concludes EFh is taken and calls it — when its driver is on INT
+    /// 6Dh, which it never even looks at. Vectors we actually service still
+    /// have to look claimed.
+    #[test]
+    fn unserviced_vectors_read_back_as_the_bios_dummy() {
+        let dos = MiniDos::new();
+        let mut cpu = MockCpu::new();
+        dos.install_trampolines(cpu.mem());
+        let seg_of = |cpu: &MockCpu, v: usize| rd16(cpu.mem_ref(), v * 4 + 2);
+
+        for v in SERVICED_VECTORS {
+            assert_eq!(seg_of(&cpu, *v as usize), TRAMP_SEG, "INT {v:#04x} must look claimed");
+        }
+        for v in [0xEF, 0x6D, 0x7E, 0x60] {
+            assert_eq!(seg_of(&cpu, v), BIOS_DUMMY_SEG, "INT {v:#04x} must look free");
+        }
+        // Below the free range nothing moves: MUSIC.COM reads INT 48h and takes
+        // TRAMP_SEG as its "no resident copy" marker.
+        for v in [0x48, 0x0A, 0x5F] {
+            assert_eq!(seg_of(&cpu, v), TRAMP_SEG, "INT {v:#04x} is BIOS/DOS territory");
+        }
+        // The ROM's top — reset vector and machine ID — stays untouched.
+        assert!(cpu.mem_ref()[0xFFFF0..0x100000].iter().all(|b| *b == 0));
+        // Both kinds still trap, so the unimplemented tally keeps working.
+        assert_eq!(dos.trap_vector(TRAMP_SEG, 0x21 * 2), Some(0x21));
+        assert_eq!(dos.trap_vector(BIOS_DUMMY_SEG, 0xEF - 0x60), Some(0xEF));
+        assert_eq!(dos.trap_vector(0x1000, 0), None);
+    }
+
     #[test]
     fn reading_an_unopened_handle_is_an_error() {
         let mut dos = MiniDos::new();

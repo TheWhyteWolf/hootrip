@@ -934,3 +934,95 @@ simply short.
 
 **Decode the console first, next time.** It cost an afternoon of disassembly to
 learn things the driver had already printed.
+
+---
+
+## 15. Three things the console named, and the IVT convention behind two of them
+
+### 15.1 — `cplay98`: the board's IRQ jumper
+
+FPLAY Ver.0 printed 「常駐に失敗しました。割込み設定をＩＮＴ５に変更してください。」 —
+*failed to stay resident; change the interrupt setting to INT 5* — and exited.
+`HOOTRIP_IO_DEBUG=1` shows it reading **SSG reg 0x0E exactly once**: the
+PC-9801-26K's IRQ jumper, the same register `preset_muse_irq_jumper` already
+writes for MUSDRV. The board's jumper positions are INT0/INT41/INT5/INT6 →
+IRQ3/10/12/13 → INT 0Bh/12h/14h/15h, and `0xC0` selects INT5 — which is what
+MUSDRV wanted too, from the other end. Extending the preset to the `fplay`
+shells makes FPLAY print 「ＩＮＴ５に常駐しました。」 and play.
+
+**10 sets / 139 titles.** The 34 `fplay` sets that already worked were re-swept
+with and without the preset: **1,831 audible titles either way**, same status on
+every set. The jumper does not disturb a driver that was already happy with
+INT0.
+
+Note this did *not* split on the FPLAY build the way `fgplay_h` split on OPNDRV:
+six distinct FPLAY.COM binaries are always silent and ten others never are, but
+all sixteen are the same 16,138 bytes and half their bytes differ. The jumper
+is what separates them, not a version number.
+
+### 15.2 — `magic_98`: one word, two handles
+
+MAGIC_98's INT 7Fh handler reads port 0x7E2 as a **word**:
+
+```asm
+in  ax,dx          ; 0x7E2
+or  ah,ah
+jz  skip_timbre    ; high byte 0 -> no timbre at all
+mov bl,ah          ; AH = the DOS handle of the timbre file
+... lseek, read, driver call 3 "load timbre" ...
+skip_timbre:
+mov bl,al          ; AL = the song handle
+```
+
+The harness was presenting the low byte alone, so `AH` was zero, the timbre
+branch was skipped, and the driver stayed resident printing
+「音色が指定されていません」 — *no timbre specified*. Title codes here are
+`0x06SS`: byte 1 is the timbre rom's offset, the low byte the song's. Scoped to
+the `magic_98` stub deliberately — "a file rom sits at offset byte 1" is true of
+**83 sets across seven families**, most of which already play.
+
+### 15.3 — The free-vector convention
+
+Fixing the word was not enough: MAGIC_98 still called `INT EFh`, which nothing
+serves, while its driver sat on `INT 6Dh`. Its 282-byte stub says why:
+
+```asm
+mov ax,0x35ef      ; get the INT EFh vector
+int 21h
+cmp bx,0xfff0      ; BIOS dummy?  -> nobody owns EFh
+jnz use_ef         ; someone does -> call EFh
+mov ax,0x356d      ; else try INT 6Dh
+...
+```
+
+A PC-98 leaves **unclaimed vectors pointing at the BIOS dummy `IRET` in segment
+0xFFF0**, and drivers read that back to find a vector nobody owns.
+`install_trampolines` pointed all 256 vectors at our own `TRAMP_SEG`, so every
+such probe was told "yes, taken" and the caller then talked to a vector nobody
+serves.
+
+Pointing *every* unserviced vector at 0xFFF0 broke 29 sets. MUSIC.COM
+(`music_98`) reads INT 48h and treats **segment 0x60** — which `TRAMP_SEG`
+happens to be — as its "no resident copy" marker; with 48h moved to the BIOS
+dummy it matched INT 0Ah's segment and MUSIC.COM concluded a copy of itself was
+already resident, printed so, and exited. Both drivers are right about their own
+half of the machine: **PC-98 reserves INT 00h–5Fh for BIOS and DOS, and leaves
+60h–FFh as the free application range** — which is exactly where drivers install
+their APIs (PMD on 60h, MDRV and EMD on D2h, MAGIC on 6Dh/EFh). So only
+unserviced vectors at 0x60 and above read as the BIOS dummy. The dummy handlers
+sit at the bottom of segment 0xFFF0 so the top of the ROM — the reset vector and
+machine ID at 0xFFFF0 — is left alone.
+
+**12 sets / 175 titles**, and a convention that will matter to every future
+driver that asks whether a vector is free.
+
+### 15.4 — Result
+
+**22 sets / 314 titles**, 42 of 42 sampled tracks at −3.2 to −18.5 dBFS, and no
+regression or title-count change anywhere in the 337-set sweep.
+The 70-set control re-ripped **688 of 688 tracks byte-identical** — unlike the
+unopened-handle change, none of these three moves a set that was already
+playing. That is what you would expect: two are scoped to one stub each, and the
+third only changes what a guest reads back from vectors nothing was serving.
+
+Across the day: **66 sets / 1,303 titles**, leaving **160 sets / 3,091 titles**.
