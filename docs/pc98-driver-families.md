@@ -1026,3 +1026,30 @@ playing. That is what you would expect: two are scoped to one stub each, and the
 third only changes what a guest reads back from vectors nothing was serving.
 
 Across the day: **66 sets / 1,303 titles**, leaving **160 sets / 3,091 titles**.
+
+### 15.5 — The queue, and where to start next
+
+157 sets / 3,032 titles (excluding the `(SC-88)` MIDI variants, which the
+exclusion lists used earlier in this document did *not* filter — they match
+`(SC-55` but not `(SC-88`, and that inflated `valky_98` by three sets).
+
+| stub | sets | titles | what the guest says |
+|---|---:|---:|---|
+| `usmd` | 7 | 208 | resident and healthy; 4 unserviced `INT 7Eh AH=0` |
+| `usd_98` | 12 | 208 | `sound vector 0x15`, one timer IRQ, both OPN timer flags stuck set |
+| `odq_98` | 5 | 192 | 「サウンドボードがありません！」 — board detection fails |
+| `synup_98` | 6 | 112 | 「内蔵音源ボード(FM6,0188H)」 then `Abnormal program termination` |
+| `ss_98` | 5 | 107 | resident, 15 writes, 3 key-ons, 0 s span |
+| `muse_98` | 6 | 106 | MUSE2 installs cleanly; its API is on **INT 05h** |
+| `muspj_98` | 7 | 90 | 162 timer IRQs, 354 writes, 14 captured |
+| `fmxp` | 5 | 83 | `FMX` / `FMXP` run to budget |
+| `magpa_98` | 4 | 77 | 「MPU-PC98 インターフェイスチェック中」 — stalls probing MIDI |
+| ~30 more | 100 | 1,849 | |
+
+Only **two** silent sets still have a working twin in the same archive folder
+(`nlp_hoot`, 63 titles) — that hint, which caught the 86 board and signature D,
+is nearly exhausted. The console messages are the live lead now.
+
+`odq_98` is the one to start on: 192 titles behind a driver that says in plain
+words it cannot find the sound board, and board detection is a re-host concern
+with a history of reaching sets nobody was aiming at.
