@@ -537,3 +537,58 @@ display name: `dang_98` (8 titles) and `dang2_98` (39) both write to
 GS/MT-32 entries onto its `(OPN)` folder as well. A control that rips one entry
 and diffs the folder reports the other entry's tracks as missing. That is the
 79 "missing" in this run, and it is not a rip failure.
+
+---
+
+## 10. Where the queue stands after signature A
+
+Measured 2026-09-16 by re-ripping every pc98dos archive that was entirely
+silent in the promoted library (`archive-rip --only-archives`, 15 s captures —
+enough to tell audible from silent, not a library rip), then re-running the
+recovered subset against the pre-signature-A build to attribute the gains.
+
+**337 OPN-family sets were silent at promotion. 111 now produce audio (2,511
+titles); 226 remain (4,731 titles).** Split by cause:
+
+| | sets | titles |
+|---|---:|---:|
+| the INT 14h sound-vector fix (before today) | 70 | 1,820 |
+| signature A (environment block, INT 1Ch, `dummysndrom`) | 41 | 691 |
+
+Signature A's 691 breaks down as `fgplay_h` 28 sets / 470, `nlp_hoot` 9 / 165,
+and 4 sets / 56 titles elsewhere that the `dummysndrom` byte unblocked
+(`zark_98`, `yositune`, `imado_98`, `amidaex`).
+
+**Do not read the INT 14h fix's reach as signature A's.** That fix alone
+accounts for `pmd_98`'s 461 recovered titles, `mxj_98`'s 131 and `fmxp`'s 127 —
+families signature A never touched. Comparing a fresh sweep against the
+promoted library conflates the two, because the library predates both.
+
+### What remains
+
+| stub | sets | titles | signature |
+|---|---:|---:|---|
+| `valky_98` | 11 | 398 | B — PIT hooked but not ticking |
+| `pmd_98` | 9 | 357 | D — sequencing real music, no voice ever programmed |
+| `emd_98` | 12 | 218 | C — activity finishes before the capture opens |
+| `fmxp` | 14 | 216 | — |
+| `usmd` | 7 | 208 | — |
+| `usd_98` | 12 | 208 | — |
+| `odq_98` | 5 | 192 | — |
+| `magic_98` | 12 | 185 | — |
+| `cplay98` | 10 | 156 | — |
+| ~20 more | 134 | 2,593 | — |
+
+Two cautions carried forward from today, both now with a second data point:
+
+- **The stub still does not predict the failure.** `fgplay_h` split on the
+  *driver version* inside it (OPNDRV ≤2.03 worked, ≥2.04 never did);
+  `nlp_hoot` split into three unrelated causes; and `fmxp` and `pmd_98` now sit
+  on *both* sides of the line — 9 `fmxp` sets recovered and 14 did not.
+  Re-diagnose before grouping.
+- **Fixing the re-host beats fixing a family.** Every gain above came from the
+  DOS/BIOS layer — a vector, an environment block, a BIOS call, a ROM byte —
+  and each one reached sets nobody was aiming at. `cplay98` and `usd_98`
+  appearing here at all is the same signal in reverse: supported families
+  failing on a subset, which has so far always meant a per-set binding
+  difference rather than a missing capability.
