@@ -711,3 +711,118 @@ is interpreted as the OPNA "extend" bit, and a driver writing a PCM mode byte
 with bit 0 clear would silently disable bank-1 readback. No set is known to do
 it; worth remembering if bank-1 status polling ever stalls a set that otherwise
 looks healthy.
+
+---
+
+## 12. Signature B, and the DOS call that hid it
+
+Signature B was filed as "PIT hooked but not ticking": `valky_98` hooks INT 08h,
+0Bh, 50h and B0h, `opn timer used: false`, exactly one timer IRQ. The diagnostic
+also reported `funcvect: -`, which read as "this family has no stub". Both
+readings were downstream of something simpler.
+
+`VALKY_98.COM` **is** a stub — 806 bytes that load `CSCP.BIN` from handle 5,
+patch it, start it, and then install INT 7Fh and idle:
+
+```asm
+01FD  mov dx,0x210
+0200  mov ax,0x257f     ; set INT 7Fh -> cs:0x210
+0203  int 21h
+0205  mov dx,0x7e8
+0208  mov al,0x81       ; EXT_STATE = STUB_READY
+020A  out dx,al
+020B  sti
+020C  hlt
+020D  jmp 0x20c
+```
+
+It never got there. The shell chain reported `Terminated(0)`, and the trace put
+the exit at `INT 20h` executed from PSP:0000 — a `.COM` falling off the end of
+its own stack. Walking the INT 21h sequence backwards, termination followed
+immediately after this:
+
+```asm
+01DD  mov bx,0x7        ; handle 7 — nothing in this set binds it
+01E0  mov ah,0x3f
+01E2  int 21h
+01E4  jc  0x1f9         ; error -> skip the play call, install INT 7Fh, idle
+```
+
+`AH=3Fh` on a handle nobody opened returned **success with zero bytes**. The
+carry stayed clear, so the stub took the "the data is here" branch and handed
+its driver a buffer it had never filled; the driver returned into the weeds and
+the program died before reaching the line that makes it a stub. Real DOS returns
+CF=1 with AX=6, *invalid handle*. Handles 0-4 are the ones DOS always has open,
+and an empty read of those is a legitimate EOF — so the error is scoped to
+handles 5 and up.
+
+One line, and every `valky_98` set in the queue came back: **8 sets / 177 titles**
+(the remaining three are the `(SC-88)` MIDI variants, which were never
+candidates — note that the MIDI exclusion lists used for these measurements
+match `(SC-55` but not `(SC-88`). 16 of 16 sampled tracks render at −2.3 to
+−17.8 dBFS.
+
+The lesson is the one from §10 again, sharper: **`funcvect: -` and "the PIT is
+not ticking" were both symptoms of a DOS call answering wrongly two steps
+earlier.** Read the shell chain's outcome before reading the capture — a stub
+that reports `Terminated` never installed anything, so nothing downstream of it
+means what it appears to mean.
+
+### Where the queue stands
+
+Three changes in this pass — the 86-board PCM FIFO, the `.COM` allocation, and
+the unopened-handle error — total **32 sets / 772 titles**, with no regression
+and no title-count change anywhere in the 337-set sweep.
+
+| stub | sets | titles | signature |
+|---|---:|---:|---|
+| `emd_98` | 12 | 218 | C — activity finishes before the capture opens |
+| `usmd` | 7 | 208 | — |
+| `usd_98` | 12 | 208 | — |
+| `odq_98` | 5 | 192 | — |
+| `magic_98` | 12 | 185 | — |
+| `cplay98` | 10 | 156 | — |
+| `synup_98` | 6 | 112 | — |
+| `ss_98` | 5 | 107 | — |
+| `muse_98` | 6 | 106 | — |
+| ~30 more | 114 | 2,156 | — |
+
+**194 sets / 3,650 titles**, of which only 5 sets still have a working twin in
+the same archive folder — the strongest single hint left, and the one that
+caught both of the last two signatures. Signature C (`emd_98`) leads the queue.
+
+### 12.1 — What the handle change costs
+
+The 70-set control is not byte-clean this time, and it should not be: making a
+DOS call answer differently changes the cycle count of every program that makes
+it. **630 of 688 tracks are byte-identical; 58 differ, across 5 sets.**
+
+The cause is visible in one line of the diagnostic. For Touhou Reiiden the
+entire before/after delta is:
+
+```
+-    pmd_98   -> StubReady  (1543 cyc)
++    pmd_98   -> StubReady  (1523 cyc)
+```
+
+`PMD_98.COM` probes a handle this set does not bind. The probe now returns an
+error immediately instead of walking the zero-byte copy path, so the stub is
+ready 20 cycles sooner and the capture opens at a slightly different point in
+the driver's timer phase.
+
+What that does to the music, measured rather than assumed:
+
+- **39 of the 58** have a **register-write sequence identical to the old rip** —
+  only the wait lengths between writes moved.
+- The other 19 additionally reorder **6 to 36 writes out of 224,000-384,000**
+  (0.003-0.01%), always adjacent updates landing either side of a timer tick.
+- Durations are identical to 0.1 s and peak levels agree within 0.3 dB on every
+  track sampled.
+
+This is the same effect the §9.4 control saw when the PSP moved three
+paragraphs, from a different cause. It is worth restating why it is acceptable
+here: the old answer was **wrong**. A read of a handle nobody opened is an
+error in DOS, and every program that branches on that carry was being lied to.
+Trading a 0.01% phase shift in five sets for eight sets that could not play at
+all is the right side of that trade — but the shift is real, and a rip made
+before this change will not hash-match one made after.

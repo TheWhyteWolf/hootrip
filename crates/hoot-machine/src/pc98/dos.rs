@@ -57,6 +57,11 @@ const ENV_PENDING_OWNER: u16 = 0xFFFF;
 /// so a genuinely exhausted arena still reports out-of-memory.
 const COM_MIN_STACK: usize = 0x100;
 
+/// First handle a program can have opened itself. 0-4 are the standard ones
+/// DOS always has open (stdin, stdout, stderr, aux, prn); reading an unbound
+/// one of those is an empty stdin, not an error.
+const FIRST_FILE_HANDLE: u16 = 5;
+
 /// The DOS path a program was loaded from, as its environment block records it.
 /// `default_ext` supplies the extension for a bare command name (`opndrv`), and
 /// any directory part of the name is dropped — the virtual CWD is the set folder.
@@ -1071,6 +1076,16 @@ impl MiniDos {
                 let h = cpu.reg16(Reg16::Bx);
                 let count = cpu.reg16(Reg16::Cx) as usize;
                 let dst = lin(cpu.reg16(Reg16::Ds), cpu.reg16(Reg16::Dx));
+                // A handle nobody opened is an error, not an empty file. Callers
+                // branch on the carry to decide whether the data is there, and
+                // reporting success with zero bytes sends them on to parse
+                // whatever the buffer already held — VALKY_98 reads handle 7,
+                // misses the error, and hands the driver garbage.
+                if h >= FIRST_FILE_HANDLE && !self.handles.contains_key(&h) {
+                    cpu.set_reg16(Reg16::Ax, 0x0006); // invalid handle
+                    set_cf(cpu, true);
+                    return None;
+                }
                 let (data, start) = match self.handles.get(&h) {
                     Some(of) => match self.files.get(&of.name) {
                         Some(d) => (d.clone(), of.pos),
@@ -1325,6 +1340,34 @@ mod tests {
     /// largest block it has. Grounseed's PMD86 chain left 0xFF8 paragraphs and
     /// the 1.8 KB stub after it failed with "out of memory", silencing 83
     /// titles that were otherwise ready to play.
+    /// Drivers branch on the carry after AH=3Fh to decide whether the data
+    /// arrived. Reporting success with zero bytes for a handle nobody opened
+    /// takes them down the "it worked" path with an untouched buffer: VALKY_98
+    /// reads handle 7, misses the error, hands the garbage to its driver and
+    /// dies before installing its INT 7Fh vector. Handles 0-4 are the ones DOS
+    /// always has open, and an empty read of those is legitimate.
+    #[test]
+    fn reading_an_unopened_handle_is_an_error() {
+        let mut dos = MiniDos::new();
+        dos.add_file("SONG.DAT", vec![1, 2, 3, 4]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.set_handle(5, "SONG.DAT");
+
+        let read = |dos: &mut MiniDos, cpu: &mut MockCpu, h: u16| {
+            cpu.set_reg16(Reg16::Ax, 0x3F00);
+            cpu.set_reg16(Reg16::Bx, h);
+            cpu.set_reg16(Reg16::Cx, 0x10);
+            cpu.set_reg16(Reg16::Ds, 0x0800);
+            cpu.set_reg16(Reg16::Dx, 0);
+            dos.int21(cpu);
+            (cpu.reg16(Reg16::Ax), cpu.reg16(Reg16::Flags) & hoot_cpu::flag::CF != 0)
+        };
+        assert_eq!(read(&mut dos, &mut cpu, 5), (4, false), "a bound handle reads its file");
+        assert_eq!(read(&mut dos, &mut cpu, 7), (6, true), "an unopened handle is error 6");
+        assert_eq!(read(&mut dos, &mut cpu, 0), (0, false), "stdin is open and empty");
+    }
+
     #[test]
     fn com_loader_takes_a_block_short_of_64k() {
         let mut dos = MiniDos::new();
