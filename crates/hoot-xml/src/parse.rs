@@ -19,6 +19,15 @@ pub fn decode_file(path: &Path) -> Result<String> {
     Ok(decode_bytes(&bytes))
 }
 
+/// Decode Shift_JIS bytes, unconditionally. For text that is known to be
+/// Shift_JIS with no declaration to sniff — a PC-98 guest's console output, for
+/// instance, where `from_utf8_lossy` turns every message into replacement
+/// characters and throws away the one thing that says why a driver gave up.
+pub fn decode_shift_jis(bytes: &[u8]) -> String {
+    let (s, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+    s.into_owned()
+}
+
 /// Decode raw bytes: sniff the XML declaration, default to Shift_JIS (the
 /// archive's dominant encoding) when no declaration is found.
 pub fn decode_bytes(bytes: &[u8]) -> String {

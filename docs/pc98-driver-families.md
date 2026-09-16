@@ -896,3 +896,41 @@ every one of them turned out to be a DOS or board-level defect rather than the
 driver-API gap it was filed as. `cplay98` appearing in the list above is the
 next thing worth pulling on — it is a *supported* family failing on 10 sets,
 which has so far always meant a per-set binding difference.
+
+---
+
+## 14. Read the guest's console — it was being thrown away
+
+`Pc98RipOutcome::console` came from `String::from_utf8_lossy`. A PC-98 guest
+writes **Shift_JIS**, so every Japanese message a driver printed arrived as a
+row of replacement characters, and the diagnostic's most direct evidence — the
+driver saying in words why it gave up — was unreadable. Decoding it properly
+(and stripping the ANSI colour escapes the guests pepper it with) changed the
+remaining queue from twenty near-identical "StubReady, no writes" rows into
+this:
+
+| stub | titles | what the guest says |
+|---|---:|---|
+| `usd_98` | 208 | *(harness)* `missing file ILM_03.USO` — a set file absent from the archive folder |
+| `odq_98` | 192 | 「サウンドボードがありません！」 — "there is no sound board" |
+| `magic_98` | 185 | 「音色が指定されていません」 — "no timbre specified", then resident |
+| `cplay98` | 156 | 「常駐に失敗しました。割込み設定をＩＮＴ５に変更してください。」 — "failed to stay resident; change the interrupt setting to INT 5" |
+| `synup_98` | 112 | 「内蔵音源ボード(FM6,0188H)」 then `Abnormal program termination` |
+| `muse_98` | 106 | `MUSE2 Ver 2.2 installed.` — healthy; its API sits on **INT 05h**, which nothing services |
+| `magpa_98` | 77 | 「MPU-PC98 インターフェイスチェック中」 — stalls probing for MIDI |
+| `mfd_98` | 69 | `Abnormal program termination` |
+| `usmd` | 208 | 「USMD APIが使用可能です」 — resident and healthy; 4 unserviced `INT 7Eh AH=0` |
+
+Two of those name the same missing capability from opposite directions:
+`cplay98`'s FPLAY Ver.0 *asks* for the OPN IRQ jumper to select INT 5, and
+`muse_98`'s MUSE2 installs its API there. §2's `preset_muse_irq_jumper` already
+writes SSG reg 0x0E to steer exactly this choice — it presets `0xC0` (INT 14h)
+for MUSDRV. The jumper, not the family, is the unit of work again.
+
+`usd_98` is not an emulation problem at all: a file the gamelist references is
+not on disk. Worth checking against the unpack traps in the archive notes
+(flattened subdirectories, Shift_JIS names) before assuming the archive is
+simply short.
+
+**Decode the console first, next time.** It cost an afternoon of disassembly to
+learn things the driver had already printed.

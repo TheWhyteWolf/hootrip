@@ -1010,7 +1010,7 @@ pub fn rip_title(
     log.end_t = capture_budget;
 
     let mut console = notes;
-    console.push_str(&String::from_utf8_lossy(&dos.con_out));
+    console.push_str(&console_text(&dos.con_out));
 
     Ok(Pc98RipOutcome {
         log,
@@ -1102,6 +1102,31 @@ fn selected_song(romlist: &RomList, title_code: u64) -> Option<String> {
                 .find(|r| r.kind == "conin" && r.offset == Some(low) && !is_engine_name(&r.name))
         })
         .map(|r| r.name.rsplit(['\\', '/', ':']).next().unwrap_or(&r.name).to_string())
+}
+
+/// A PC-98 guest writes its console in **Shift_JIS**, and peppers it with ANSI
+/// colour escapes. Decoding it as UTF-8 replaces every Japanese message with
+/// question marks, which is how "there is no sound board" — the driver telling
+/// you exactly why it gave up — reaches a diagnostic as unreadable noise.
+fn console_text(bytes: &[u8]) -> String {
+    let text = hoot_xml::decode_shift_jis(bytes);
+    // Strip CSI sequences (ESC [ ... final byte): they colour the reader's own
+    // terminal and carry nothing about what the driver did.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Bind the selected song to the DOS handle(s) the driver reads and set the
@@ -1437,7 +1462,7 @@ pub fn trace_title(
         int_counts,
         fm_writes: io.total_writes,
         stalled,
-        console: String::from_utf8_lossy(&dos.con_out).into_owned(),
+        console: console_text(&dos.con_out),
         unknown_ports: io.unknown.clone(),
     })
 }
@@ -1788,4 +1813,25 @@ fn install_idle_stub(cpu: &mut dyn X86Cpu) {
     cpu.set_ss_sp(IDLE_SEG, 0xF000); // ~61 KB of stack headroom below the arena
     let f = cpu.reg16(Reg16::Flags) | flag::IF;
     cpu.set_reg16(Reg16::Flags, f);
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::console_text;
+
+    /// The guest writes Shift_JIS. `from_utf8_lossy` turned odq_98's
+    /// 「サウンドボードがありません！」 — "there is no sound board", the whole
+    /// diagnosis for 192 silent titles — into a row of replacement characters.
+    #[test]
+    fn shift_jis_console_survives_and_ansi_does_not() {
+        let sjis = b"\x1b[33m\x83T\x83E\x83\x93\x83h\x83{\x81[\x83h\x82\xaa\x82\xa0\x82\xe8\x82\xdc\x82\xb9\x82\xf1\x81I\x1b[37m";
+        assert_eq!(console_text(sjis), "サウンドボードがありません！");
+    }
+
+    /// A bare ESC, or a CSI nobody terminated, must not eat the rest of the log.
+    #[test]
+    fn a_stray_escape_does_not_swallow_the_message() {
+        assert_eq!(console_text(b"ok\x1bdone"), "ok\u{1b}done");
+        assert_eq!(console_text(b"ok\x1b[999"), "ok");
+    }
 }
