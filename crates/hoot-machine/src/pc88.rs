@@ -302,7 +302,16 @@ pub fn rip_title(
     }
     let probe_secs = opts.seconds.min(PROBE_SECONDS);
     for &cand in DATA_ADDR_CANDIDATES {
-        let probe = rip_title_at(game, set_dir, title_code, opts, Some(cand), probe_secs)?;
+        // A probe that cannot even load is a candidate that does not apply, not
+        // a failure of the rip. Probing is the only path that reads the bgm file
+        // for these sets, so propagating the error here would turn a set whose
+        // catalogue names a bgm file the archive does not carry from a benign
+        // `silent` census entry into `error` — a regression against the plain
+        // capture we already hold.
+        let Ok(probe) = rip_title_at(game, set_dir, title_code, opts, Some(cand), probe_secs)
+        else {
+            continue;
+        };
         if hoot_log::audibility(&probe.log).is_silent() {
             continue;
         }
@@ -317,12 +326,20 @@ pub fn rip_title(
         // second, different title to produce a different stream before trusting
         // the address.
         if let Some(other) = other_title_code(game, title_code) {
-            let probe2 = rip_title_at(game, set_dir, other, opts, Some(cand), probe_secs)?;
+            // Cannot rip the other title, so cannot show the stream depends on
+            // which song was selected: leave the address unproven.
+            let Ok(probe2) = rip_title_at(game, set_dir, other, opts, Some(cand), probe_secs)
+            else {
+                continue;
+            };
             if same_stream(&probe.log, &probe2.log) {
                 continue;
             }
         }
-        let mut full = rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)?;
+        let Ok(mut full) = rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)
+        else {
+            continue;
+        };
         full.bgm_addr_used = Some(cand);
         return Ok(full);
     }

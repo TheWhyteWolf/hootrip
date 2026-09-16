@@ -83,6 +83,15 @@ struct OpenFile {
     pos: usize,
 }
 
+/// What the guest asked the PC-98 timer BIOS (INT 1Ch) to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BiosTimerReq {
+    /// Call `seg:off` once, `ticks` BIOS timer ticks from now.
+    Arm { seg: u16, off: u16, ticks: u16 },
+    /// Drop the pending one-shot, wherever it has got to.
+    Cancel,
+}
+
 /// A minimal DOS environment shared across a set's shell-command chain.
 pub struct MiniDos {
     /// Virtual working directory: UPPERCASE filename -> contents.
@@ -105,10 +114,11 @@ pub struct MiniDos {
     /// Read calls (AH=3Fh): (handle, bytes returned), for diagnostics — reveals
     /// whether a funcvect stub actually read the song data we handed it.
     pub read_log: Vec<(u16, usize)>,
-    /// A PC-98 timer-BIOS one-shot the guest has armed and we still owe it:
-    /// (routine segment, offset, delay in 10 ms BIOS ticks). The harness turns
-    /// this into a cycle deadline and then calls the routine as an interrupt.
-    pub bios_timer: Option<(u16, u16, u16)>,
+    /// The guest's latest PC-98 timer-BIOS request, waiting to be picked up.
+    /// The harness drains this every step, so a cancel has to travel the same
+    /// path as an arm — clearing the field would only clear a request the
+    /// harness has already taken, leaving a cancelled callback to fire.
+    pub bios_timer: Option<BiosTimerReq>,
 }
 
 // ---- little-endian helpers over the flat image --------------------------
@@ -883,12 +893,14 @@ impl MiniDos {
     fn int1c(&mut self, cpu: &mut dyn X86Cpu) {
         match ah(cpu) {
             0x02 => {
-                let es = cpu.reg16(Reg16::Es);
-                let bx = cpu.reg16(Reg16::Bx);
-                self.bios_timer = Some((es, bx, cpu.reg16(Reg16::Cx)));
+                self.bios_timer = Some(BiosTimerReq::Arm {
+                    seg: cpu.reg16(Reg16::Es),
+                    off: cpu.reg16(Reg16::Bx),
+                    ticks: cpu.reg16(Reg16::Cx),
+                });
                 self.enable_irqs_on_return(cpu);
             }
-            0x01 => self.bios_timer = None,
+            0x01 => self.bios_timer = Some(BiosTimerReq::Cancel),
             f => *self.unimpl.entry((0x1C, f)).or_default() += 1,
         }
     }
@@ -1316,18 +1328,21 @@ mod tests {
         cpu.set_reg16(Reg16::Cx, 2);
         cpu.interrupt(0x1C);
         assert!(dos.service_int(&mut cpu, 0x1C).is_none());
-        assert_eq!(dos.bios_timer, Some((0x1005, 0x184D, 2)));
+        assert_eq!(dos.bios_timer, Some(BiosTimerReq::Arm { seg: 0x1005, off: 0x184D, ticks: 2 }));
 
         dos.iret_return(&mut cpu);
         assert_ne!(cpu.reg16(Reg16::Flags) & hoot_cpu::flag::IF, 0);
         assert_eq!(cpu.reg16(Reg16::Cs), 0x1234);
         assert_eq!(cpu.reg16(Reg16::Ip), 0x0056);
 
-        // AH=01 cancels a pending one-shot.
+        // AH=01 cancels. It has to be posted as a request, not a clear: the
+        // harness drains this field every step, so by now the arm is long gone
+        // from here and only the engine's copy can still fire.
+        dos.bios_timer = None; // as the harness leaves it after picking the arm up
         cpu.set_reg16(Reg16::Ax, 0x0100);
         cpu.interrupt(0x1C);
         assert!(dos.service_int(&mut cpu, 0x1C).is_none());
-        assert_eq!(dos.bios_timer, None);
+        assert_eq!(dos.bios_timer, Some(BiosTimerReq::Cancel));
     }
 
     #[test]

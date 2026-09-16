@@ -1256,7 +1256,14 @@ fn write_track(
 }
 
 fn finalize_status(sum: &mut SetSummary, any_timeout: bool) {
-    if !sum.err.is_empty() {
+    // `err` carries the first failure message either way, but a failure that
+    // took down one title is not a failure of the set: those are counted in
+    // `error_titles` and the tallies below decide between "error" and
+    // "partial". Only a set-level failure (nothing was even attempted) short-
+    // circuits here — otherwise a set that lost one missing-rom title out of
+    // forty would be filed as "error" and re-ripped in full by every later
+    // --retry-failed pass.
+    if !sum.err.is_empty() && sum.error_titles == 0 {
         sum.status = "error".into();
         return;
     }
@@ -2222,10 +2229,13 @@ fn triage(
         }
     }
     // A set whose every track was silent leaves an empty folder behind.
-    // remove_dir refuses to touch a non-empty directory, so this can only
-    // ever clear the ones the move emptied.
+    // remove_dir refuses to touch a non-empty directory, so this can only ever
+    // clear the ones the move emptied — but skip `dir` itself. Tracks sitting
+    // directly in the directory the user named (a single set folder, or a flat
+    // pool of exports) key on that directory, and this command promises never
+    // to delete anything of theirs.
     let mut pruned = 0usize;
-    for set in sets.keys() {
+    for set in sets.keys().filter(|s| s.as_path() != dir) {
         if std::fs::remove_dir(set).is_ok() {
             pruned += 1;
         }

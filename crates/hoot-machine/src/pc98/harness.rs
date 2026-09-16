@@ -31,7 +31,9 @@ use hoot_cpu::{flag, np2::Np2Cpu, Reg16, Stop, X86Cpu};
 use hoot_log::{Chip, Device, RegWrite, RegisterLog};
 use hoot_xml::{parse_num, Game, RomList};
 
-use super::dos::{ExecResult, MiniDos, ProgKind, ARENA_END, CALL_RET_OFF, TRAMP_SEG};
+use super::dos::{
+    BiosTimerReq, ExecResult, MiniDos, ProgKind, ARENA_END, CALL_RET_OFF, TRAMP_SEG,
+};
 use super::io::Pc98Io;
 
 /// Nominal PC-98 CPU clock (80286/V30 class, ~8 MHz). The OPN is paced in its
@@ -373,12 +375,17 @@ impl Engine<'_> {
         if self.io.take_eoi() {
             self.opn_in_service = false;
         }
-        // PC-98 timer BIOS one-shot (INT 1Ch AH=02). Arming it is a DOS-level
-        // call, so pick the request up here and turn it into a cycle deadline —
-        // before the IF gate, since arming does not depend on interrupt state.
-        if let Some((seg, off, ticks)) = self.dos.bios_timer.take() {
-            let due = self.cycle + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU;
-            self.bios_timer = Some((seg, off, due));
+        // PC-98 timer BIOS (INT 1Ch). The guest posts arm/cancel as a DOS-level
+        // call, so pick the request up here and turn an arm into a cycle
+        // deadline — before the IF gate, since neither depends on interrupt
+        // state.
+        match self.dos.bios_timer.take() {
+            Some(BiosTimerReq::Arm { seg, off, ticks }) => {
+                let due = self.cycle + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU;
+                self.bios_timer = Some((seg, off, due));
+            }
+            Some(BiosTimerReq::Cancel) => self.bios_timer = None,
+            None => {}
         }
         if !self.irqs_enabled() {
             if self.io.opn.peek_irq_edge() {
@@ -810,9 +817,7 @@ pub fn rip_title(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
-    if opts.dummy_sndrom {
-        cpu.mem()[PC98_SNDROM_INT_OFF] = PC98_SNDROM_INT;
-    }
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
 
     let mut notes = materialize(&mut dos, romlist, set_dir);
@@ -1266,9 +1271,7 @@ pub fn trace_title(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
-    if opts.dummy_sndrom {
-        cpu.mem()[PC98_SNDROM_INT_OFF] = PC98_SNDROM_INT;
-    }
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
     let _ = materialize(&mut dos, romlist, set_dir);
     // Bind rom→handle as the capture path does, so `--trace` reflects the real
@@ -1317,8 +1320,12 @@ pub fn trace_title(
     let mut win_irqs = 0u64;
 
     while steps < max_steps {
-        if let Some((seg, off, ticks)) = dos.bios_timer.take() {
-            bios_timer = Some((seg, off, cycles + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU));
+        match dos.bios_timer.take() {
+            Some(BiosTimerReq::Arm { seg, off, ticks }) => {
+                bios_timer = Some((seg, off, cycles + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU));
+            }
+            Some(BiosTimerReq::Cancel) => bios_timer = None,
+            None => {}
         }
         // Deliver a pending timer IRQ between instructions, as hardware would.
         if cpu.reg16(Reg16::Flags) & flag::IF != 0 {
@@ -1480,9 +1487,7 @@ pub fn trace_capture(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
-    if opts.dummy_sndrom {
-        cpu.mem()[PC98_SNDROM_INT_OFF] = PC98_SNDROM_INT;
-    }
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
     let _ = materialize(&mut dos, romlist, set_dir);
     let mut song_file = selected_song(romlist, title_code);
@@ -1683,6 +1688,18 @@ pub fn trace_capture(
     let irqs = eng.irqs;
 
     Ok(CaptureTrace { steps, hot, frozen, wild_jumps, api_calls, reads, fm_writes, irqs, shell })
+}
+
+/// Install or remove the PC-98 sound BIOS's presence byte.
+///
+/// Always written, never merely set: the NP2 core's memory is a process global
+/// and the per-rip wipe covers only conventional RAM (`0..0xA_0000`), so a byte
+/// left in the BIOS ROM window by one set is still there for the next set in
+/// the same process. `pc98-sweep` runs hundreds of sets that way, and a driver
+/// that finds this byte behaves differently — so a set with `dummysndrom` would
+/// silently turn on the sound BIOS for every set swept after it.
+fn set_sound_bios(cpu: &mut dyn X86Cpu, present: bool) {
+    cpu.mem()[PC98_SNDROM_INT_OFF] = if present { PC98_SNDROM_INT } else { 0 };
 }
 
 /// Enter `seg:off` the way hardware enters an interrupt handler — flags, CS and
