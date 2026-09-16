@@ -52,6 +52,11 @@ pub const ARENA_END: u16 = 0xA000;
 /// zero means "free", which would let the PSP allocation take the block back.
 const ENV_PENDING_OWNER: u16 = 0xFFFF;
 
+/// Headroom a `.COM` needs above its image for the stack DOS parks at the top
+/// of its segment. Programs that big are already pathological; the check exists
+/// so a genuinely exhausted arena still reports out-of-memory.
+const COM_MIN_STACK: usize = 0x100;
+
 /// The DOS path a program was loaded from, as its environment block records it.
 /// `default_ext` supplies the extension for a bare command name (`opndrv`), and
 /// any directory part of the name is dropped — the virtual CWD is the set folder.
@@ -326,6 +331,30 @@ impl MiniDos {
         }
     }
 
+    /// Size in paragraphs of the largest single free block in the arena. DOS
+    /// hands a `.COM` the largest block it has rather than a round 64 KB, and
+    /// a resident that took a big buffer (PMD86's 384 KB PCM arena) can leave
+    /// the best remaining block a few paragraphs short of 64 KB. Blocks are
+    /// coalesced on free, so the largest single block is also the most `alloc`
+    /// can satisfy.
+    pub fn largest_free(&self, mem: &[u8]) -> u16 {
+        let mut seg = ARENA_START;
+        let mut best = 0;
+        loop {
+            let l = lin(seg, 0);
+            let sig = rd8(mem, l);
+            let block_owner = rd16(mem, l + 1);
+            let block_size = rd16(mem, l + 3);
+            if block_owner == 0 {
+                best = best.max(block_size);
+            }
+            if sig == b'Z' {
+                return best;
+            }
+            seg = seg + 1 + block_size;
+        }
+    }
+
     pub fn alloc(&self, mem: &mut [u8], paras: u16, owner: u16) -> Option<u16> {
         let mut seg = ARENA_START;
         loop {
@@ -527,9 +556,20 @@ impl MiniDos {
         let env_seg = self
             .alloc_env(cpu.mem(), ENV_PENDING_OWNER, &program_path(name, "COM"))
             .ok_or_else(|| anyhow::anyhow!("out of memory building environment for {name:?}"))?;
-        // A .COM wants a full 64 KB segment; allocate the largest block we can,
-        // capped at 0x1000 paragraphs (64 KB), like DOS hands a COM everything.
-        let need = 0x1000u16; // 64 KB in paragraphs
+        // A .COM wants a full 64 KB segment, but DOS hands it the largest free
+        // block and no more. Demanding a round 0x1000 paragraphs turns a block
+        // that is merely a little short into a spurious "out of memory":
+        // Grounseed's P86DRV takes a 384 KB PCM buffer and leaves 0xFF8 — 128
+        // bytes under 64 KB, and ample for the 1.8 KB stub that failed there.
+        let need = self.largest_free(cpu.mem_ref()).min(0x1000);
+        let room = need as usize * 16;
+        if room < 0x100 + image.len() + COM_MIN_STACK {
+            anyhow::bail!(
+                "out of memory loading .COM ({} bytes, largest free block {} bytes)",
+                image.len(),
+                room
+            );
+        }
         let psp_seg = self
             .alloc(cpu.mem(), need, 0)
             .ok_or_else(|| anyhow::anyhow!("out of memory loading .COM ({} bytes)", image.len()))?;
@@ -553,7 +593,7 @@ impl MiniDos {
         self.dta = (psp_seg, 0x80);
         cpu.set_reg16(Reg16::Ds, psp_seg);
         cpu.set_reg16(Reg16::Es, psp_seg);
-        cpu.set_ss_sp(psp_seg, 0xFFFE);
+        cpu.set_ss_sp(psp_seg, (room.min(0x10000) as u16).wrapping_sub(2));
         // AX = 0 (both FCB drive checks "valid").
         cpu.set_reg16(Reg16::Ax, 0);
         cpu.set_cs_ip(psp_seg, 0x100);
@@ -1278,6 +1318,36 @@ mod tests {
         assert_eq!(cpu.mem_ref()[lin(psp, 0x80)], 6);
         assert_eq!(&cpu.mem_ref()[lin(psp, 0x81)..lin(psp, 0x87)], b"/K /M8");
         assert_eq!(cpu.mem_ref()[lin(psp, 0x87)], 0x0D); // CR terminator
+    }
+
+    /// A resident that took a large buffer leaves the arena's best block short
+    /// of a round 64 KB. DOS still loads a `.COM` there — it hands out the
+    /// largest block it has. Grounseed's PMD86 chain left 0xFF8 paragraphs and
+    /// the 1.8 KB stub after it failed with "out of memory", silencing 83
+    /// titles that were otherwise ready to play.
+    #[test]
+    fn com_loader_takes_a_block_short_of_64k() {
+        let mut dos = MiniDos::new();
+        dos.add_file("PMD_98.COM", vec![0x90, 0xC3]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+
+        // Eat the arena down to a single free block a few paragraphs under 64 KB.
+        let total = dos.largest_free(cpu.mem_ref());
+        let short = 0x1000 - 8;
+        dos.alloc(cpu.mem(), total - short - 1, 0x4321).unwrap();
+        assert_eq!(dos.largest_free(cpu.mem_ref()), short);
+
+        let (img, _) = dos.resolve_program("pmd_98").unwrap();
+        let psp = dos.load_com(&mut cpu, "pmd_98", &img, b"").unwrap();
+        // The stack sits at the top of what we actually got, not a presumed 64 KB.
+        assert_eq!(cpu.reg16(Reg16::Ss), psp);
+        assert!(cpu.reg16(Reg16::Sp) < 0xFFFE, "sp must not point past the block");
+        // PSP:0x02 is the first paragraph beyond the allocation.
+        let owned = rd16(cpu.mem_ref(), lin(psp - 1, 0) + 3);
+        assert_eq!(rd16(cpu.mem_ref(), lin(psp, 0x02)), psp + owned);
+        assert_eq!(cpu.reg16(Reg16::Sp), (owned as u32 * 16) as u16 - 2);
     }
 
     #[test]

@@ -579,6 +579,10 @@ promoted library conflates the two, because the library predates both.
 | `cplay98` | 10 | 156 | — |
 | ~20 more | 134 | 2,593 | — |
 
+**§11 supersedes the `pmd_98` and `fmxp` rows.** Both split on the PC-9801-86
+board, not on the family: `pmd_98`'s 9 sets and 9 of `fmxp`'s 14 are gone from
+this queue. `valky_98` is what the order should follow now.
+
 Two cautions carried forward from today, both now with a second data point:
 
 - **The stub still does not predict the failure.** `fgplay_h` split on the
@@ -592,3 +596,118 @@ Two cautions carried forward from today, both now with a second data point:
   appearing here at all is the same signal in reverse: supported families
   failing on a subset, which has so far always meant a per-set binding
   difference rather than a missing capability.
+
+---
+
+## 11. The PC-9801-86 board, worked through
+
+Signature D was filed as "voice data never loaded" on the strength of a
+`pmd_98` set that sequenced real music and classified `NoVoice`. It was not a
+voice-binding problem, and `pmd_98` was not the unit of work. Re-bucketing the
+sweep by **machine kind** and by **whether a set's same-archive twin rips**
+found the real boundary in one pass:
+
+| still-silent sets | sets | titles |
+|---|---:|---:|
+| a twin in the same archive folder rips | 24 | 716 |
+| …of which kind `86` | 22 | 653 |
+| no working twin | 202 | 4,015 |
+
+All nine remaining `pmd_98` sets were the **`(86)`** variant of a set whose
+`(OPN)` twin already ripped — `imd_4_98` had a working `(OPNA)` twin too. Same
+driver binary, same song data, same harness configuration (kinds `86` and
+`opna` are folded together everywhere: same chip, clock, ports and S98 device).
+Only the *shell chain* differed, and the 86 chain pulls in the board's PCM
+driver. Two defects were hiding behind that, and neither is a driver-API gap.
+
+### 11.1 — The PCM FIFO that never filled
+
+PMD86's IRQ handler polls the 86 board's PCM control register:
+
+```asm
+2E53  mov dx,0xa468
+      in  al,dx
+      test al,0x10     ; bit 4: "the FIFO wants more data"
+      jz  0x2e60       ; clear -> go sequence the FM chip
+      call 0x677       ; set   -> push another block
+      jmp 0x2e53
+```
+
+`0xA468` had no read arm, so it returned the unmodelled-port default of `0xFF`
+— bit 4 permanently set. The driver refilled a FIFO that never filled and never
+reached the FM sequencer: **860,060 reads of one port** in a five-second
+capture, 117 FM writes, a 1 ms write span.
+
+The 86 board's PCM is a separate DAC with no S98 or VGM device to carry it, so
+the honest model is a FIFO that never starves — `PCM86_FIFO_REQ` always reads
+clear. The driver skips its PCM feed and gets on with the FM, which is the part
+we can log. Writes to `0xA468` are now retained so the driver's
+read-modify-write rate and FIFO-reset updates see their own bits back, and the
+rest of `0xA461..0xA46F` reads as 0 rather than falling through to 0xFF — a
+driver polling any of them for a flag should see "nothing pending", not "every
+bit set". Same set afterwards: 18,848 FM writes, 472 key-ons, the full 5 s.
+
+### 11.2 — A `.COM` that would not fit in 65,408 bytes
+
+Grounseed then failed one step later, on its own stub:
+
+```
+pmd_98  -> Error("out of memory loading .COM (1805 bytes)")
+```
+
+with 63 KB free. `load_com` asked the arena for a round `0x1000` paragraphs —
+its own comment said "allocate the largest block we can", but the code demanded
+exactly 64 KB. Grounseed's `P86DRV /24` takes a 384 KB PCM buffer, leaving a
+largest free block of `0xFF8` paragraphs: 128 bytes under 64 KB, and ample for
+a 1.8 KB stub. DOS hands a `.COM` the largest block it has, so the loader now
+does too, and parks SP at the top of what it actually got instead of a presumed
+`0xFFFE`. That is a general DOS-layer fix; it happened to surface here because
+the 86 chains are the ones that allocate big buffers.
+
+### 11.3 — Result
+
+Re-swept all 337 previously-silent OPN-family sets against the pre-fix build:
+
+**24 sets recovered, 595 of their 742 titles, 0 regressions and 0 title-count
+changes anywhere else.**
+
+| stub | sets | titles | |
+|---|---:|---:|---|
+| `pmd_98` | 9 | 298 | all of signature D's remainder |
+| `fmxp` | 9 | 127 | the `(86)` half of the split noted in §10 |
+| `klp_hoot` | 2 | 86 | |
+| `rhymes98` | 1 | 33 | |
+| `fmxpb` | 2 | 26 | |
+| `pmp_hoot` | 1 | 25 | |
+
+Two independent checks on the other side of the ledger:
+
+- 41 of 41 sampled recovered tracks render through libvgm at −0.0 to −15.0 dBFS,
+  so the audibility call is not just our own classifier agreeing with itself.
+- The 70-set control from §9.4 — all audible before this change, one of them an
+  `86`-kind set — re-ripped at full length: **688 of 688 tracks byte-identical**.
+  Unlike the environment-block work, this change moves nothing in a set that was
+  already playing: the new `0xA461..0xA46F` read arms only fire on ports that
+  previously counted as unmodelled, and the loader takes the same round `0x1000`
+  paragraphs whenever the arena has them.
+
+### 11.4 — What is left of the 86 kind
+
+6 sets / 239 titles, and none of them are 86-board problems — the diagnostic
+puts each in a signature that has nothing to do with the board:
+
+| set | titles | signature |
+|---|---:|---|
+| `valkyrie_98`, `mariner_98`, `injuda_98` | 192 | B — `VALKY_98` runs to budget or exits; PIT not ticking |
+| `v_btr_98`, `v_ctr_98` | 35 | FMX/FMXP run to budget |
+| `msw98` | 12 | `puzp` runs to budget |
+
+**The queue after this work: 202 sets / 3,989 titles.** `valky_98` (signature B)
+is now both the largest single bucket and the only thing standing between us and
+the last of the 86 sets, which moves it up the order.
+
+One loose end noted while mapping the board and left alone: a write to `0xA460`
+is interpreted as the OPNA "extend" bit, and a driver writing a PCM mode byte
+with bit 0 clear would silently disable bank-1 readback. No set is known to do
+it; worth remembering if bank-1 status polling ever stalls a set that otherwise
+looks healthy.
