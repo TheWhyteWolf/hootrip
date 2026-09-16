@@ -826,3 +826,73 @@ error in DOS, and every program that branches on that carry was being lied to.
 Trading a 0.01% phase shift in five sets for eight sets that could not play at
 all is the right side of that trade — but the shift is real, and a rip made
 before this change will not hash-match one made after.
+
+---
+
+## 13. Signature C — not a capture window, a filename
+
+`emd_98` looked like the capture opening too late: the driver alive with 478
+timer IRQs, 839 FM writes, but **1 write captured**, a 10 ms span and no
+key-ons. The stub settles it in 144 bytes:
+
+```asm
+0147  mov dx,0x180
+014A  mov cx,0xffff
+014D  mov ah,0x3f
+014F  xor bx,bx
+0151  int 21h            ; read handle 0 into cs:0x180
+0153  jc  0x16d
+0155  mov bx,ax          ; bx = bytes read
+0157  mov byte [bx+0x180],0   ; NUL-terminate it
+015C  mov ah,0x1
+015E  int 0xd2           ; EMD "load song file"
+0160  cmp al,0
+0162  jnz 0x13c          ; failed -> return without playing
+0164  mov ah,0x3
+0166  int 0xd2           ; play
+```
+
+Writing a NUL at the byte count you just read back is only meaningful for a
+**string**. `emd_98` is a third `opens_by_name` family: handle 0 carries the
+song's *filename*, and the set's gamelist says so — every `.EMI` is a `file` rom
+at `offset="-1"` (materialized, never handle-bound) with a matching **`conin`**
+rom at the title code. Handed the file's content instead, `INT D2h AH=1` fails,
+the stub takes its `jnz` exit, and what is left is the timer the previous call
+started, ticking over a driver with no song. That is the "1 write in 10 ms" —
+not a window problem at all.
+
+Adding the `emd_98` shell prefix to `opens_by_name` recovers **all 12 sets, 217
+of 218 titles**, 18 of 18 sampled tracks at −0.3 to −16.5 dBFS. Nothing else in
+the 337-set sweep changed by a single title, which is what a prefix-scoped
+change should look like.
+
+That makes **four** families now found to open the song by name — cplay98/FPLAY,
+MUSDRV/mbmusp, MDRV acidplan, and EMD. §1 called this "the central discovery of
+this campaign"; it has now outlived three separate re-diagnoses, and is worth
+checking early whenever a stub reads handle 0 and the driver then reports
+failure.
+
+### Where the queue stands after this pass
+
+Four changes today — the 86-board PCM FIFO, the `.COM` allocation, the
+unopened-handle error and the `emd_98` filename — recover **44 sets / 989
+titles**, with no regression anywhere in the sweep.
+
+| stub | sets | titles |
+|---|---:|---:|
+| `usmd` | 7 | 208 |
+| `usd_98` | 12 | 208 |
+| `odq_98` | 5 | 192 |
+| `magic_98` | 12 | 185 |
+| `cplay98` | 10 | 156 |
+| `synup_98` | 6 | 112 |
+| `ss_98` | 5 | 107 |
+| `muse_98` | 6 | 106 |
+| `muspj_98` | 7 | 90 |
+| ~35 more | 112 | 1,946 |
+
+**182 sets / 3,432 titles remain**, and the five signatures of §8 are spent:
+every one of them turned out to be a DOS or board-level defect rather than the
+driver-API gap it was filed as. `cplay98` appearing in the list above is the
+next thing worth pulling on — it is a *supported* family failing on 10 sets,
+which has so far always meant a per-set binding difference.

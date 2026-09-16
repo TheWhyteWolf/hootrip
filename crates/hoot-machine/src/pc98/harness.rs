@@ -1138,7 +1138,13 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     // the content path. cplay98 additionally plays a 0-based in-bank index off
     // port 0x7E4 (title byte 2); MUSDRV/MDRV are one file per song.
     let cplay_family = shell_starts(&["cplay", "fplay"]);
-    let opens_by_name = cplay_family || shell_starts(&["musdrv", "mbmusp", "mdrv_9", "mddrv_9"]);
+    // EMD (`emd_98`) joins them: its stub reads handle 0 into a buffer, writes a
+    // NUL at the byte count it just got back, and passes that to INT D2h AH=1 —
+    // terminating a *string*, which is only meaningful for a filename. Handed
+    // content instead, AH=1 fails, the stub takes its `jnz` exit and returns
+    // without ever calling the play entry, leaving a timer ticking over silence.
+    let opens_by_name =
+        cplay_family || shell_starts(&["musdrv", "mbmusp", "mdrv_9", "mddrv_9", "emd_98"]);
     if let Some(sf) = song_file {
         if opens_by_name {
             eng.dos.set_handle_text(0, sf);
