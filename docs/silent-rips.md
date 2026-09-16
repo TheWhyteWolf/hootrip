@@ -50,6 +50,20 @@ in the wild and both render to pure zero:
 Both also re-evaluate retroactively: unmuting a channel, or starting the
 envelope, can give voice to a level that was latched earlier.
 
+### Where the gate is applied
+
+Every path that writes a track classifies it first: `archive-rip` (both the pc88
+and pc98dos loops), `rip`, `pc98-rip`, and the two sweeps. `pc98-rip` was the
+exception until 2026-09-16 — it still used the original "did it write anything"
+test, so a single-set rip shipped files the batch rip would have dropped. The
+tell is a track with a few dozen writes and no notes: the NL family's
+`音色定義` timbre-definition pseudo-tracks program ~60 registers, key on
+nothing, and rendered to digital zero.
+
+If you are validating a fix by ripping one set, use a build after that date, or
+run `hootrip triage` over the output — otherwise a designed-silent pseudo-track
+reads as a failure of the fix.
+
 ### Validation
 
 Verdicts were checked against audio rendered by libvgm (`vgm2wav --loops 1

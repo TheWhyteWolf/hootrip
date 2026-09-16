@@ -372,6 +372,7 @@ fn pc98_diag(
         deadline_secs: None,
         opn_clock_hz: None,
         fm_variant: is_fm_variant(g),
+        dummy_sndrom: has_dummy_sndrom(g),
     };
 
     println!("{}", g.name);
@@ -604,6 +605,7 @@ fn pc98_rip(
         deadline_secs: None,
         opn_clock_hz,
         fm_variant: is_fm_variant(g),
+        dummy_sndrom: has_dummy_sndrom(g),
     };
     let volmod = vgm_volume_modifier(headroom_db);
     let system = g
@@ -661,8 +663,13 @@ fn pc98_rip(
 
         let n_writes = outcome.log.writes.len();
         let base = format!("{:02} {}", i, sanitize(&track_name));
-        let status = if n_writes == 0 {
-            "NO WRITES"
+        // Same gate as archive-rip and the pc88 `rip`: a capture that cannot
+        // make a sound is not written. Writing anything with a register in it
+        // was the old test, and it ships silent files — a timbre-definition
+        // pseudo-track programs 60-odd registers and keys on nothing.
+        let class = hoot_log::audibility(&outcome.log);
+        let status = if class.is_silent() {
+            class.tag()
         } else {
             if format == "s98" || format == "both" {
                 let mut tags = S98Tags::default();
@@ -760,6 +767,7 @@ fn pc98_sweep(
             deadline_secs: Some(4.0),
             opn_clock_hz: None,
             fm_variant: is_fm_variant(g),
+            dummy_sndrom: has_dummy_sndrom(g),
         };
         if std::env::var_os("HOOTRIP_SWEEP_TRACE").is_some() {
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
@@ -914,6 +922,13 @@ fn clockmul_of(g: &hoot_xml::Game) -> u32 {
 /// a set in FM-variant mode captures that FM music instead of silent MIDI churn.
 fn is_fm_variant(g: &hoot_xml::Game) -> bool {
     g.options.iter().any(|o| o.name == "midiout")
+}
+
+/// hoot's `dummysndrom` option: this set's driver talks to the sound board
+/// through its BIOS ROM, so the harness must present one (see
+/// `Pc98RipOptions::dummy_sndrom`).
+fn has_dummy_sndrom(g: &hoot_xml::Game) -> bool {
+    g.options.iter().any(|o| o.name == "dummysndrom" && o.value != "0")
 }
 
 /// The game name to tag an FM-variant rip with: strip the MIDI-device and
@@ -1369,6 +1384,7 @@ fn rip_one_set(
                 deadline_secs: deadline,
                 opn_clock_hz: None,
                 fm_variant: is_fm_variant(g),
+                dummy_sndrom: has_dummy_sndrom(g),
             };
             let system = g
                 .driver_alias

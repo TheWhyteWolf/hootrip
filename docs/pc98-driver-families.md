@@ -202,7 +202,7 @@ was entirely this artifact.
 
 ---
 
-## 4. The remaining silent sets — a ranked queue
+## 7. The remaining silent sets — a ranked queue
 
 After the audibility gate landed (see [silent-rips](silent-rips.html)), the sets
 that produce *nothing* are countable rather than hidden in a pile of silent
@@ -310,7 +310,7 @@ the MCB chain, unimplemented DOS/INT calls, and the guest's console output.
 
 ---
 
-## 5. Plan for the sets that are still silent
+## 8. Plan for the sets that are still silent
 
 After the INT 14h fix, **75 sets / 2,084 tracks** recovered and **268 sets /
 5,518 titles** remain silent (MIDI/GS variants excluded — those are not
@@ -388,3 +388,127 @@ Read in this order: which vectors got hooked, `sound vector`, `timer IRQs`,
 unimplemented-call tally and the guest's console output. The five signatures
 above are each visible in those lines alone.
 
+
+---
+
+## 9. Signature A, worked through
+
+Signature A was "the driver calls an interrupt the harness does not service".
+That held, but the *interrupt* turned out to be a symptom in every case, not the
+cause — and the two clusters had nothing in common beyond the symptom. Three
+separate defects, all in the DOS/BIOS re-host rather than in any driver family:
+
+| defect | what it broke | sets | titles |
+|---|---|---:|---:|
+| no environment block (`PSP:0x2C = 0`) | FUGA OPNDRV 2.04+ overwrote its own code | 27 | 418 |
+| PC-98 timer BIOS (INT 1Ch) unserviced | Packen NL / MUAPLAY calibration never ended | 9 | 167 |
+| no sound-BIOS ROM (`dummysndrom`) | FUGA OPNDRV 1.23 and others found no board | 4 | 125 |
+
+Two sets are left in A, both **OPNA variants whose OPN twin already rips**:
+`sakura_k_98` and `majokko_98` run NAX 6.26, whose OPNA path is **80386 code**
+(`push edx`, `push fs` at NAX.COM:12A9). The i286 core traps it as an invalid
+opcode ~2M times. Fixing that means an i386 core, not a driver change.
+
+### A.1 — The environment block
+
+`fgplay_h` presented as `INT 0xd2 AH=0x00 ×1,142,859`: a spin. The spin is
+`fgplay_h.com` at 0x14A, polling the driver's status call until it reports
+ready, which can never happen because the driver is not resident. The stub was
+never the problem.
+
+`OPNDRV.COM` **2.04 and later** copy their own program path out of the
+environment block and into their PSP, so it survives the block being freed:
+
+```asm
+mov  ah,0x30 / int 0x21   ; DOS 3+?
+mov  bx,[0x2c]            ; the environment segment
+dec  bx / mov es,bx       ; its MCB
+mov  cx,[es:3] / shl cx,4 ; block size in bytes
+repne scasb / dec cx / scasb / jnz  ; find the \0\0 ending the variable list
+rep  movsb                ; copy what follows into the PSP
+```
+
+With `PSP:0x2C = 0` — which is what `load_com` wrote, `// no environment for
+now` — `dec bx` makes `ES = 0xFFFF`, the size comes from `[0xFFFF:0003]`, and
+`rep movsb` copies ~9,500 bytes of low memory over the program's own code.
+OPNDRV then falls into the PSP's `INT 20h` and terminates, which the diagnostic
+reported as `opndrv -> Terminated(0)` with no hooked `INT D2h`.
+
+Versions **2.03 and earlier do not have this code**, which is exactly why 5 of
+the 32 `fgplay_h` sets always worked and 27 never did. Version, not game:
+
+| OPNDRV | before | after |
+|---|---|---|
+| 1.23, 1.32, 2.00, 2.02, 2.03 | Resident | Resident (unchanged) |
+| 2.04, 2.05, 2.06 | **Terminated(0)** | **Resident** |
+
+`MiniDos::alloc_env` now builds the real thing — variable strings, the NUL that
+closes the list, a `0x0001` count word, the program's path — allocates it below
+the PSP as DOS does, and stamps the PSP as its owner so `AH=49h` can free it.
+Rendered through `vgm2wav`, 20 tracks sampled across 5 of the recovered sets
+peak at −6 to −19 dBFS; none is silent.
+
+### A.2 — The PC-98 timer BIOS
+
+Packen Software's NL 1.32 / MUAPLAY 1.21 / NAX size their I/O busy-waits by
+measuring the machine: arm a one-shot callback, count iterations of a tight loop
+until it fires, keep the count.
+
+```asm
+mov ah,2 / mov cx,2 / mov bx,0x184d / push cs / pop es / int 0x1c
+inc word [0x2124] / mov cx,0x10 / loop $      ; count
+cmp byte [0x2126],0 / jz  ...                 ; until the callback sets the flag
+```
+
+`INT 1Ch` is the PC-98 **timer BIOS**, and it was unserviced, so the flag never
+set and the driver counted forever — `nl -> RanToBudget`, nothing installed.
+
+Two things were needed. `MiniDos::int1c` records the request, and the harness
+turns it into a cycle deadline and enters the routine as an interrupt (`enter_far`
+— `X86Cpu::interrupt` only dispatches through the IVT, and a BIOS callback has no
+vector). And the call must **return with interrupts enabled**: the driver arms the
+one-shot with `IF` clear, so a BIOS that returned as it was called could never
+deliver what it had just armed. `enable_irqs_on_return` sets `IF` in the frame the
+trampoline's `IRET` restores.
+
+The tick is modelled at 100 Hz. Only its order of magnitude reaches the music —
+the constant sizes busy-waits; tempo comes off the OPN timer or the PIT.
+
+All 9 sets install and play: `nl` ×5 (Spread, Outer Formula, CRW Metal Jacket,
+Magic Master, Block Quest V) and `MUAPLAY` ×4 (Kids SAP, Quintia Road, Wrestle
+Angels, Presence), 45–239 key-ons each over a 3.2–5.0 s window.
+
+### A.3 — `dummysndrom`
+
+A real PC-9801-26K/86 board carries a BIOS ROM, and software that drives the
+board through it asks the ROM which software interrupt it serves. hoot maps a
+stand-in for the 76 sets that ask (`<option name="dummysndrom" value="1"/>`);
+the harness mapped nothing, so OPNDRV 1.23 read zero, concluded there was no
+sound board, and kept an 80-byte stub resident instead of the driver:
+
+```asm
+mov ax,0xcee0 / mov es,ax / mov al,[es:4]   ; the sound BIOS's interrupt number
+mov [0x142],al
+cmp byte [0x142],0xd2 / jnz <no board>
+```
+
+We model that one byte, the only field we have direct evidence a driver reads,
+rather than inventing ROM contents — a set that probes something else stays
+visibly silent instead of quietly wrong. It recovers Beat Vice, Imadoki Junjyou
+Monogatari, Zark Legend Special and Amida Extra (125 titles). Yoshitsune gets as
+far as 1,429 timer IRQs and a full-length write span but still no key-on, and
+the `odq_98` sets (Deflektor, Majoriko, H-Go! Yeah!) are unchanged — those fail
+for other reasons.
+
+### A.4 — Validation
+
+Ripped in full and rendered through `vgm2wav`: **261 of 263 tracks across the 13
+sets A.2 and A.3 recovered are audible**, −1.8 to −21.6 dBFS. The two exceptions
+are `音色定義` timbre-definition pseudo-tracks (Outer Formula `NEIRO_2.O`, CRW
+Metal Jacket `MJ_00.O`) — 95 writes, 60-odd registers programmed, nothing keyed
+on, silent by design. The gate calls them `dead` and drops them; finding them in
+the output is what surfaced the `pc98-rip` gate gap recorded in
+[silent-rips](silent-rips.html) §2.
+
+For the `fgplay_h` sets, 20 tracks sampled across 5 of the 27 peak at −6 to
+−19 dBFS with none silent.

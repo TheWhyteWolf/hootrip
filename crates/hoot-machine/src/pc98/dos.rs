@@ -47,6 +47,22 @@ const LOL_OFF: u16 = 0x0010;
 pub const ARENA_START: u16 = 0x1000;
 /// One past the last usable paragraph (640 KB conventional top for our purposes).
 pub const ARENA_END: u16 = 0xA000;
+/// Placeholder owner for a program's environment block, held between allocating
+/// it and allocating the PSP that will own it. Any non-zero value does: owner
+/// zero means "free", which would let the PSP allocation take the block back.
+const ENV_PENDING_OWNER: u16 = 0xFFFF;
+
+/// The DOS path a program was loaded from, as its environment block records it.
+/// `default_ext` supplies the extension for a bare command name (`opndrv`), and
+/// any directory part of the name is dropped — the virtual CWD is the set folder.
+fn program_path(name: &str, default_ext: &str) -> String {
+    let up = name.to_uppercase();
+    let base = up.rsplit(['\\', '/', ':']).next().unwrap_or(&up);
+    match base.contains('.') {
+        true => format!("C:\\{base}"),
+        false => format!("C:\\{base}.{default_ext}"),
+    }
+}
 
 /// The `HLT` byte that fronts every trampoline entry (traps to the harness).
 const HLT: u8 = 0xF4;
@@ -89,6 +105,10 @@ pub struct MiniDos {
     /// Read calls (AH=3Fh): (handle, bytes returned), for diagnostics — reveals
     /// whether a funcvect stub actually read the song data we handed it.
     pub read_log: Vec<(u16, usize)>,
+    /// A PC-98 timer-BIOS one-shot the guest has armed and we still owe it:
+    /// (routine segment, offset, delay in 10 ms BIOS ticks). The harness turns
+    /// this into a cycle deadline and then calls the routine as an interrupt.
+    pub bios_timer: Option<(u16, u16, u16)>,
 }
 
 // ---- little-endian helpers over the flat image --------------------------
@@ -123,6 +143,7 @@ impl MiniDos {
             unimpl: BTreeMap::new(),
             con_out: Vec::new(),
             read_log: Vec::new(),
+            bios_timer: None,
         }
     }
 
@@ -444,11 +465,58 @@ impl MiniDos {
         wr8(mem, p + 0x81 + n, 0x0D);
     }
 
+    /// Allocate and fill the environment block DOS hands a child process.
+    ///
+    /// Layout is exactly MS-DOS's: the variable strings (each ASCIIZ), one more
+    /// NUL closing the list, a `0x0001` count word, then the program's own path
+    /// as ASCIIZ. The block is owned by `owner` so the program can free it.
+    ///
+    /// This is not decoration. A program that wants to know where it was loaded
+    /// from walks this layout — scan for the `\0\0` that ends the variable list,
+    /// copy what follows into its PSP, then release the block. With PSP:0x2C
+    /// left at zero that walk starts from segment 0xFFFF, reads a garbage block
+    /// length out of `[0xFFFF:0003]`, and `rep movsb`s kilobytes of nonsense
+    /// over the program's own code. FUGA System's OPNDRV 2.04 and later do
+    /// precisely this, and so overwrote themselves and fell into the PSP's
+    /// INT 20h instead of going resident — 27 sets that never played a note.
+    ///
+    /// Keep the block tight: the copy length is whatever remains of it after
+    /// the variable list, and the destination is inside the caller's PSP.
+    fn alloc_env(&self, mem: &mut [u8], owner: u16, path: &str) -> Option<u16> {
+        let mut env: Vec<u8> = Vec::new();
+        env.extend_from_slice(b"COMSPEC=C:\\COMMAND.COM\0");
+        env.push(0); // end of the variable list
+        env.extend_from_slice(&[0x01, 0x00]); // trailing-name count
+        env.extend_from_slice(path.as_bytes());
+        env.push(0);
+        let paras = env.len().div_ceil(16) as u16;
+        let seg = self.alloc(mem, paras, owner)?;
+        let base = lin(seg, 0);
+        for b in &mut mem[base..base + paras as usize * 16] {
+            *b = 0;
+        }
+        mem[base..base + env.len()].copy_from_slice(&env);
+        Some(seg)
+    }
+
     // ---- program loaders ------------------------------------------------
 
     /// Load a `.COM` image: PSP + image at PSP:0x100, all segregs = PSP,
     /// SP just below the 64 KB (or block) top. Returns the PSP segment.
-    pub fn load_com(&mut self, cpu: &mut dyn X86Cpu, image: &[u8], tail: &[u8]) -> anyhow::Result<u16> {
+    pub fn load_com(
+        &mut self,
+        cpu: &mut dyn X86Cpu,
+        name: &str,
+        image: &[u8],
+        tail: &[u8],
+    ) -> anyhow::Result<u16> {
+        // The environment goes below the PSP, as DOS builds it: copied first,
+        // then the program loaded above it. Owner is patched to the PSP once we
+        // have one (a zero owner would mark the block free and hand it straight
+        // back to the .COM allocation below).
+        let env_seg = self
+            .alloc_env(cpu.mem(), ENV_PENDING_OWNER, &program_path(name, "COM"))
+            .ok_or_else(|| anyhow::anyhow!("out of memory building environment for {name:?}"))?;
         // A .COM wants a full 64 KB segment; allocate the largest block we can,
         // capped at 0x1000 paragraphs (64 KB), like DOS hands a COM everything.
         let need = 0x1000u16; // 64 KB in paragraphs
@@ -459,8 +527,8 @@ impl MiniDos {
         // Re-stamp the block's owner to itself (PSP).
         let mcb = psp_seg - 1;
         wr16(cpu.mem(), lin(mcb, 0) + 1, owner);
+        wr16(cpu.mem(), lin(env_seg - 1, 0) + 1, psp_seg);
 
-        let env_seg = 0; // no environment for now
         let mem_top = psp_seg + need;
         self.build_psp(cpu.mem(), psp_seg, mem_top, tail, env_seg);
 
@@ -484,7 +552,13 @@ impl MiniDos {
 
     /// Load an `.EXE` (MZ) image: parse the header, place the load module, apply
     /// relocations, set CS:IP / SS:SP from the (relocated) header. Returns PSP.
-    pub fn load_exe(&mut self, cpu: &mut dyn X86Cpu, image: &[u8], tail: &[u8]) -> anyhow::Result<u16> {
+    pub fn load_exe(
+        &mut self,
+        cpu: &mut dyn X86Cpu,
+        name: &str,
+        image: &[u8],
+        tail: &[u8],
+    ) -> anyhow::Result<u16> {
         if image.len() < 0x20 || &image[0..2] != b"MZ" {
             anyhow::bail!("not an MZ executable");
         }
@@ -506,6 +580,11 @@ impl MiniDos {
         }
         let load_size = image_size.saturating_sub(hdr_size);
 
+        // The environment goes below the PSP, as DOS builds it (see `alloc_env`).
+        let env_seg = self
+            .alloc_env(cpu.mem(), ENV_PENDING_OWNER, &program_path(name, "EXE"))
+            .ok_or_else(|| anyhow::anyhow!("out of memory building environment for {name:?}"))?;
+
         // Allocate PSP + load module + requested BSS.
         let load_paras = (load_size + 15) / 16;
         let need = (0x10 + load_paras + min_alloc) as u16; // PSP is 0x10 paras
@@ -514,10 +593,11 @@ impl MiniDos {
             .ok_or_else(|| anyhow::anyhow!("out of memory loading .EXE"))?;
         let mcb = psp_seg - 1;
         wr16(cpu.mem(), lin(mcb, 0) + 1, psp_seg);
+        wr16(cpu.mem(), lin(env_seg - 1, 0) + 1, psp_seg);
 
         let load_seg = psp_seg + 0x10; // program loads just past the PSP
         let mem_top = psp_seg + need;
-        self.build_psp(cpu.mem(), psp_seg, mem_top, tail, 0);
+        self.build_psp(cpu.mem(), psp_seg, mem_top, tail, env_seg);
 
         // Copy the load module.
         let dst = lin(load_seg, 0);
@@ -725,8 +805,8 @@ impl MiniDos {
             .resolve_program(name)
             .ok_or_else(|| anyhow::anyhow!("shell program {name:?} not found in set"))?;
         match kind {
-            ProgKind::Com => self.load_com(cpu, &image, tail.as_bytes())?,
-            ProgKind::Exe => self.load_exe(cpu, &image, tail.as_bytes())?,
+            ProgKind::Com => self.load_com(cpu, name, &image, tail.as_bytes())?,
+            ProgKind::Exe => self.load_exe(cpu, name, &image, tail.as_bytes())?,
         };
 
         let mut total: u64 = 0;
@@ -768,6 +848,7 @@ impl MiniDos {
             0x27 => return Some(ExecResult::Resident),
             0x21 => return self.int21(cpu),
             0x18 => self.int18(cpu),
+            0x1C => self.int1c(cpu),
             _ => {
                 *self.unimpl.entry((vec, ah(cpu))).or_default() += 1;
             }
@@ -783,6 +864,32 @@ impl MiniDos {
             // Key sense / read: no key available.
             0x00 | 0x01 => cpu.set_reg16(Reg16::Ax, 0),
             _ => {}
+        }
+    }
+
+    /// PC-98 timer BIOS (INT 1Ch) — the one-shot callback, and cancelling it.
+    ///
+    /// `AH=02` arms a far routine at `ES:BX` to be called once `CX` BIOS timer
+    /// ticks have passed; `AH=01` cancels a pending one. Packen Software's NL /
+    /// MUAPLAY / NAX drivers arm it with `CX=2` and then count iterations of a
+    /// tight loop until the routine fires, turning the result into the constant
+    /// their I/O busy-waits are sized from. With the call unserviced the routine
+    /// never fires and the driver counts forever — it never returns to DOS, let
+    /// alone goes resident.
+    ///
+    /// Only the delay's *order of magnitude* reaches the music: the constant
+    /// sizes busy-waits, while tempo comes off the OPN timer or the PIT. Other
+    /// `AH` values stay in the unimplemented tally rather than being guessed at.
+    fn int1c(&mut self, cpu: &mut dyn X86Cpu) {
+        match ah(cpu) {
+            0x02 => {
+                let es = cpu.reg16(Reg16::Es);
+                let bx = cpu.reg16(Reg16::Bx);
+                self.bios_timer = Some((es, bx, cpu.reg16(Reg16::Cx)));
+                self.enable_irqs_on_return(cpu);
+            }
+            0x01 => self.bios_timer = None,
+            f => *self.unimpl.entry((0x1C, f)).or_default() += 1,
         }
     }
 
@@ -1045,6 +1152,16 @@ impl MiniDos {
     /// Return from a serviced software interrupt: pop IP/CS/FLAGS off the guest
     /// stack (as `IRET` would) but keep the CF/ZF our handler set as the DOS
     /// return status, restoring all other flags from the caller's saved image.
+    /// Set IF in the interrupt frame `iret_return` will restore, so a serviced
+    /// BIOS call can hand control back with interrupts enabled. Arming a timed
+    /// callback and returning with them still disabled would deadlock the
+    /// caller, which is why the real BIOS enables them here.
+    pub fn enable_irqs_on_return(&self, cpu: &mut dyn X86Cpu) {
+        let base = lin(cpu.reg16(Reg16::Ss), cpu.reg16(Reg16::Sp)) + 4;
+        let flags = rd16(cpu.mem_ref(), base) | hoot_cpu::flag::IF;
+        wr16(cpu.mem(), base, flags);
+    }
+
     pub fn iret_return(&self, cpu: &mut dyn X86Cpu) {
         let ss = cpu.reg16(Reg16::Ss);
         let sp = cpu.reg16(Reg16::Sp);
@@ -1135,7 +1252,7 @@ mod tests {
 
         let (img, kind) = dos.resolve_program("pmd_98").unwrap();
         assert_eq!(kind, ProgKind::Com);
-        let psp = dos.load_com(&mut cpu, &img, b"/K /M8").unwrap();
+        let psp = dos.load_com(&mut cpu, "pmd_98", &img, b"/K /M8").unwrap();
 
         // CS:IP at PSP:0x100, all segregs = PSP.
         assert_eq!(cpu.reg16(Reg16::Cs), psp);
@@ -1149,6 +1266,68 @@ mod tests {
         assert_eq!(cpu.mem_ref()[lin(psp, 0x80)], 6);
         assert_eq!(&cpu.mem_ref()[lin(psp, 0x81)..lin(psp, 0x87)], b"/K /M8");
         assert_eq!(cpu.mem_ref()[lin(psp, 0x87)], 0x0D); // CR terminator
+    }
+
+    #[test]
+    fn com_loader_builds_a_real_environment_block() {
+        let mut dos = MiniDos::new();
+        dos.add_file("OPNDRV.COM", vec![0x90, 0xC3]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+
+        let (img, _) = dos.resolve_program("opndrv").unwrap();
+        let psp = dos.load_com(&mut cpu, "opndrv", &img, b"").unwrap();
+
+        // PSP:0x2C names a block below the program, owned by the PSP so the
+        // program can free it once it has copied what it wants out.
+        let env = rd16(cpu.mem_ref(), lin(psp, 0x2C));
+        assert!(env != 0 && env < psp, "env {env:#x} should sit below psp {psp:#x}");
+        assert_eq!(rd16(cpu.mem_ref(), lin(env - 1, 0) + 1), psp);
+
+        // Layout: variable strings, the NUL that closes the list, a 0x0001
+        // count word, then this program's own path. Drivers that relocate their
+        // path into the PSP scan for exactly the double NUL.
+        let size = rd16(cpu.mem_ref(), lin(env - 1, 0) + 3) as usize * 16;
+        let block = &cpu.mem_ref()[lin(env, 0)..lin(env, 0) + size];
+        let end = block.windows(2).position(|w| w == [0, 0]).expect("list terminator");
+        assert_eq!(&block[..end], b"COMSPEC=C:\\COMMAND.COM");
+        assert_eq!(&block[end + 2..end + 4], &[0x01, 0x00]);
+        let path = &block[end + 4..];
+        let path = &path[..path.iter().position(|&b| b == 0).unwrap()];
+        assert_eq!(path, b"C:\\OPNDRV.COM");
+    }
+
+    #[test]
+    fn timer_bios_arms_a_callback_and_re_enables_interrupts() {
+        let mut dos = MiniDos::new();
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+        cpu.set_ss_sp(0x0900, 0x0100);
+        cpu.set_cs_ip(0x1234, 0x0056);
+
+        // The guest arms a one-shot: AH=02, ES:BX = routine, CX = ticks. It does
+        // so with interrupts disabled, which is why the BIOS must turn them back
+        // on — otherwise the callback it just armed could never be delivered.
+        cpu.set_reg16(Reg16::Ax, 0x0200);
+        cpu.set_reg16(Reg16::Es, 0x1005);
+        cpu.set_reg16(Reg16::Bx, 0x184D);
+        cpu.set_reg16(Reg16::Cx, 2);
+        cpu.interrupt(0x1C);
+        assert!(dos.service_int(&mut cpu, 0x1C).is_none());
+        assert_eq!(dos.bios_timer, Some((0x1005, 0x184D, 2)));
+
+        dos.iret_return(&mut cpu);
+        assert_ne!(cpu.reg16(Reg16::Flags) & hoot_cpu::flag::IF, 0);
+        assert_eq!(cpu.reg16(Reg16::Cs), 0x1234);
+        assert_eq!(cpu.reg16(Reg16::Ip), 0x0056);
+
+        // AH=01 cancels a pending one-shot.
+        cpu.set_reg16(Reg16::Ax, 0x0100);
+        cpu.interrupt(0x1C);
+        assert!(dos.service_int(&mut cpu, 0x1C).is_none());
+        assert_eq!(dos.bios_timer, None);
     }
 
     #[test]
@@ -1177,7 +1356,7 @@ mod tests {
         let mut dos = MiniDos::new();
         let mut cpu = MockCpu::new();
         dos.init_arena(cpu.mem());
-        let psp = dos.load_exe(&mut cpu, &img, b"").unwrap();
+        let psp = dos.load_exe(&mut cpu, "test", &img, b"").unwrap();
         let load_seg = psp + 0x10;
         // CS = load_seg + init_cs(0); relocated word == load_seg.
         assert_eq!(cpu.reg16(Reg16::Cs), load_seg);
