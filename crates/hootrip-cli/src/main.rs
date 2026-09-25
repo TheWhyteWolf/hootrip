@@ -202,7 +202,8 @@ enum Cmd {
         /// Disable loop detection (keep the full fixed-length capture)
         #[arg(long)]
         no_loop: bool,
-        /// Self-terminate a spinning capture after this many wall-clock seconds
+        /// Self-terminate a spinning capture after this many wall-clock seconds.
+        /// Applies per song, re-armed for each title, on both pc98 and pc88.
         #[arg(long)]
         deadline: Option<f64>,
     },
@@ -228,15 +229,21 @@ enum Cmd {
         /// Emulated seconds to record per song
         #[arg(long, default_value_t = 210.0)]
         seconds: f64,
-        /// Absolute per-set wall-clock ceiling in seconds. The effective budget
-        /// is `songs * title_deadline` capped by this, so a large healthy set
-        /// gets the time it needs while one pathological set can't hog a worker
-        /// indefinitely.
+        /// Absolute per-set wall-clock ceiling in seconds — a set is killed at
+        /// this point no matter its size. The effective budget is
+        /// `songs * (title_deadline + 10) + 60` capped by this, so a large
+        /// healthy set gets the time it needs while one pathological set can't
+        /// hog a worker indefinitely. Note that a set with more than roughly
+        /// `timeout / title_deadline` songs is bounded by this ceiling rather
+        /// than by its per-song budget.
         #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
-        /// Per-song wall-clock spin-guard in seconds. A single song that runs
-        /// this long (a driver stuck in a busy loop) is abandoned; healthy songs
-        /// finish in well under a second to a few seconds, so keep margin.
+        /// Per-song wall-clock spin-guard in seconds, passed to the child as
+        /// `--deadline`. A song still running after this long (a driver stuck in
+        /// a busy loop) is abandoned and its partial capture written. Cost scales
+        /// with `--seconds`: a driver that idles to HLT is skipped ahead and
+        /// finishes quickly, while a polling one emulates every cycle, so leave
+        /// generous margin or healthy songs get truncated.
         #[arg(long, default_value_t = 45.0)]
         title_deadline: f64,
         /// Output formats: s98, vgz, or both
@@ -1207,6 +1214,31 @@ fn json_str(line: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Write `bytes` to `path` via a sibling temp file and `rename`, so a killed
+/// process can never leave a truncated file that looks like a finished rip.
+/// `archive-rip` SIGKILLs children that blow their budget, and it has no way to
+/// tell a half-written .s98 from a good one.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!(
+        "{}.tmp{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!("renaming {} -> {}", tmp.display(), path.display())
+    })?;
+    Ok(())
+}
+
 /// Write one song's log to the requested format(s) under `dir/base.{s98,vgz}`.
 fn write_track(
     dir: &std::path::Path,
@@ -1225,7 +1257,7 @@ fn write_track(
         tags.set("game", game);
         tags.set("system", system);
         tags.set("s98by", "hootrip");
-        std::fs::write(dir.join(format!("{base}.s98")), write_s98(log, &tags)?)?;
+        write_atomic(&dir.join(format!("{base}.s98")), &write_s98(log, &tags)?)?;
     }
     if format == "vgz" || format == "both" {
         let gd3 = Gd3 {
@@ -1235,7 +1267,7 @@ fn write_track(
             ripper: "hootrip".into(),
             ..Default::default()
         };
-        std::fs::write(dir.join(format!("{base}.vgz")), write_vgz(log, &gd3)?)?;
+        write_atomic(&dir.join(format!("{base}.vgz")), &write_vgz(log, &gd3)?)?;
     }
     Ok(())
 }
@@ -1439,7 +1471,13 @@ fn rip_one_set(
             finalize_status(&mut sum, any_timeout);
         }
         "pc88" => {
-            let opts = hoot_machine::RipOptions { seconds, clockmul: clockmul_of(g), ..Default::default() };
+            let opts = hoot_machine::RipOptions {
+                seconds,
+                clockmul: clockmul_of(g),
+                deadline_secs: deadline,
+                ..Default::default()
+            };
+            let mut any_timeout = false;
             let system = g
                 .driver_alias
                 .as_ref()
@@ -1469,6 +1507,9 @@ fn rip_one_set(
                         continue;
                     }
                 };
+                if outcome.timed_out {
+                    any_timeout = true;
+                }
                 apply_out(&mut outcome.log);
                 // A log full of chip-init churn that never keys a note is a
                 // perfectly well-formed file that renders to digital silence;
@@ -1500,7 +1541,7 @@ fn rip_one_set(
                 }
                 sum.ripped += 1;
             }
-            finalize_status(&mut sum, false);
+            finalize_status(&mut sum, any_timeout);
         }
         _ => sum.status = "unsupported".into(),
     }
@@ -1561,7 +1602,7 @@ fn synth_json(t: &Tgt, status: &str, err: &str) -> String {
         name: t.name.clone(),
         archive: t.archive.clone(),
         status: status.into(),
-        titles: 0,
+        titles: t.titles,
         ripped: 0,
         silent_titles: 0,
         novoice_titles: 0,
@@ -1595,6 +1636,15 @@ fn archive_rip(
     dry_run: bool,
     only_archives: Option<&PathBuf>,
 ) -> Result<()> {
+    // A negative budget would panic `Duration::from_secs_f64` inside every worker
+    // (a silent "0 sets" run that still exits 0); a NaN ceiling would silently
+    // win every `.min()` and remove the cap. Reject both up front.
+    if !(title_deadline.is_finite() && title_deadline > 0.0) {
+        anyhow::bail!("--title-deadline must be a positive, finite number of seconds");
+    }
+    if !(timeout.is_finite() && timeout > 0.0) {
+        anyhow::bail!("--timeout must be a positive, finite number of seconds");
+    }
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1651,7 +1701,7 @@ fn archive_rip(
             kind,
             name: g.name.clone(),
             archive: g.romlist.as_ref().and_then(|r| r.archive.clone()).unwrap_or_default(),
-            titles: g.expanded_titles().len(),
+            titles: g.expanded_titles().iter().filter(|t| !is_stop_title(&t.name)).count(),
         });
     }
 
@@ -1749,7 +1799,10 @@ fn archive_rip(
             // lands in the census as an unexplained `timeout` with no titles.
             let grace_secs =
                 ((t.titles as f64) * (title_deadline + 10.0) + 60.0).min(timeout);
+            // The extra 15s is reaping margin on top of the emulation budget:
+            // the child's own startup and log writing happen outside it.
             let grace = std::time::Duration::from_secs_f64(grace_secs + 15.0);
+            eprintln!("[start]  #{} {} ({} songs, {grace_secs:.0}s budget)", t.ord, t.name, t.titles);
             let mut cmd = Command::new(&exe);
             cmd.arg("--archive")
                 .arg(&archive_path)
@@ -1791,8 +1844,15 @@ fn archive_rip(
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut processed = 0usize;
+    let mut write_err = None;
     for (ord, line, status) in rx {
-        writeln!(mf, "{line}")?;
+        // Don't `?` straight out: that would skip the joins below and leave the
+        // in-flight `rip-one` children orphaned, still emulating and still
+        // writing to the (probably full) disk.
+        if let Err(e) = writeln!(mf, "{line}") {
+            write_err = Some(e);
+            break;
+        }
         mf.flush().ok();
         *counts.entry(status.clone()).or_default() += 1;
         processed += 1;
@@ -1801,6 +1861,9 @@ fn archive_rip(
     }
     for h in handles {
         let _ = h.join();
+    }
+    if let Some(e) = write_err {
+        return Err(anyhow::Error::from(e).context("writing manifest"));
     }
 
     eprintln!("\narchive-rip done: {processed} sets this run");
