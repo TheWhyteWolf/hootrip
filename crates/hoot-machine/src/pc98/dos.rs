@@ -30,6 +30,38 @@ use hoot_cpu::{Reg16, X86Cpu};
 /// a real handler; at any other segment such a driver wrongly concludes it is
 /// already installed and takes its uninstall path (e.g. MUSIC.COM's `music -r`).
 pub const TRAMP_SEG: u16 = 0x0060;
+
+/// Segment a PC-98 leaves *unclaimed* interrupt vectors pointing at: the BIOS's
+/// dummy `IRET`. Drivers use it as the "is anybody home?" test — MAGIC_98 asks
+/// DOS for INT EFh, compares the segment against 0xFFF0, and only falls through
+/// to its real vector (INT 6Dh) when it sees the BIOS there. Pointing every
+/// vector at our own trampoline segment answers "yes, EFh is taken" to every
+/// such probe, and the caller then talks to a vector nobody serves.
+///
+/// So vectors [`MiniDos::service_int`] actually implements keep their
+/// [`TRAMP_SEG`] trampoline, and the rest point here — still trapped (the
+/// harness recognises the segment and keeps counting unimplemented calls), but
+/// reading back as the free vector it is. One byte per vector is enough: the
+/// harness performs the `IRET` itself rather than executing one.
+pub const BIOS_DUMMY_SEG: u16 = 0xFFF0;
+
+/// First vector in the PC-98's *free* interrupt range. 00h-5Fh belong to the
+/// BIOS and DOS — INT 18h keyboard, INT 1Ch timer, INT 21h DOS, and a crowd of
+/// others — and even the ones nothing uses point into DOS rather than at the
+/// BIOS dummy. Drivers install their APIs from 60h up (PMD on 60h, MDRV and EMD
+/// on D2h, MAGIC on 6Dh/EFh), and that is the range where "unclaimed" means
+/// 0xFFF0.
+///
+/// The split is load-bearing in both directions. MAGIC_98 reads INT EFh and
+/// wants 0xFFF0 before it will look at its real vector; MUSIC.COM reads INT 48h
+/// and treats [`TRAMP_SEG`] as the free marker — pointing 48h at the BIOS dummy
+/// makes it match INT 0Ah's segment, which it reads as "a copy of me is already
+/// resident", so it prints a message and exits. 29 sets went silent that way.
+const FREE_VECTOR_BASE: u8 = 0x60;
+
+/// Vectors [`MiniDos::service_int`] implements, and so the ones that must look
+/// claimed in the IVT even inside the free range.
+const SERVICED_VECTORS: &[u8] = &[0x18, 0x1C, 0x20, 0x21, 0x27];
 /// Offset within [`TRAMP_SEG`] of the sentinel a harness-initiated far call
 /// returns to: a single `HLT` placed just past the 512-byte trampoline table
 /// (linear 0x800), so it is never mistaken for an interrupt-vector trap
@@ -47,6 +79,32 @@ const LOL_OFF: u16 = 0x0010;
 pub const ARENA_START: u16 = 0x1000;
 /// One past the last usable paragraph (640 KB conventional top for our purposes).
 pub const ARENA_END: u16 = 0xA000;
+/// Placeholder owner for a program's environment block, held between allocating
+/// it and allocating the PSP that will own it. Any non-zero value does: owner
+/// zero means "free", which would let the PSP allocation take the block back.
+const ENV_PENDING_OWNER: u16 = 0xFFFF;
+
+/// Headroom a `.COM` needs above its image for the stack DOS parks at the top
+/// of its segment. Programs that big are already pathological; the check exists
+/// so a genuinely exhausted arena still reports out-of-memory.
+const COM_MIN_STACK: usize = 0x100;
+
+/// First handle a program can have opened itself. 0-4 are the standard ones
+/// DOS always has open (stdin, stdout, stderr, aux, prn); reading an unbound
+/// one of those is an empty stdin, not an error.
+const FIRST_FILE_HANDLE: u16 = 5;
+
+/// The DOS path a program was loaded from, as its environment block records it.
+/// `default_ext` supplies the extension for a bare command name (`opndrv`), and
+/// any directory part of the name is dropped — the virtual CWD is the set folder.
+fn program_path(name: &str, default_ext: &str) -> String {
+    let up = name.to_uppercase();
+    let base = up.rsplit(['\\', '/', ':']).next().unwrap_or(&up);
+    match base.contains('.') {
+        true => format!("C:\\{base}"),
+        false => format!("C:\\{base}.{default_ext}"),
+    }
+}
 
 /// The `HLT` byte that fronts every trampoline entry (traps to the harness).
 const HLT: u8 = 0xF4;
@@ -65,6 +123,15 @@ pub enum ExecResult {
 struct OpenFile {
     name: String,
     pos: usize,
+}
+
+/// What the guest asked the PC-98 timer BIOS (INT 1Ch) to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BiosTimerReq {
+    /// Call `seg:off` once, `ticks` BIOS timer ticks from now.
+    Arm { seg: u16, off: u16, ticks: u16 },
+    /// Drop the pending one-shot, wherever it has got to.
+    Cancel,
 }
 
 /// A minimal DOS environment shared across a set's shell-command chain.
@@ -89,6 +156,11 @@ pub struct MiniDos {
     /// Read calls (AH=3Fh): (handle, bytes returned), for diagnostics — reveals
     /// whether a funcvect stub actually read the song data we handed it.
     pub read_log: Vec<(u16, usize)>,
+    /// The guest's latest PC-98 timer-BIOS request, waiting to be picked up.
+    /// The harness drains this every step, so a cancel has to travel the same
+    /// path as an arm — clearing the field would only clear a request the
+    /// harness has already taken, leaving a cancelled callback to fire.
+    pub bios_timer: Option<BiosTimerReq>,
 }
 
 // ---- little-endian helpers over the flat image --------------------------
@@ -123,6 +195,7 @@ impl MiniDos {
             unimpl: BTreeMap::new(),
             con_out: Vec::new(),
             read_log: Vec::new(),
+            bios_timer: None,
         }
     }
 
@@ -191,21 +264,35 @@ impl MiniDos {
     /// interrupts trap to the harness until a program installs its own handler.
     pub fn install_trampolines(&self, mem: &mut [u8]) {
         let base = lin(TRAMP_SEG, 0);
+        let dummy = lin(BIOS_DUMMY_SEG, 0);
         for v in 0..256usize {
             wr8(mem, base + v * 2, HLT);
             wr8(mem, base + v * 2 + 1, IRET);
-            // IVT[v] = TRAMP_SEG:(v*2)
-            wr16(mem, v * 4, (v * 2) as u16);
-            wr16(mem, v * 4 + 2, TRAMP_SEG);
+            // The dummy handlers sit at the *bottom* of segment 0xFFF0, so the
+            // top of the ROM — the CPU reset vector and machine ID at
+            // 0xFFFF0 — is left alone.
+            let free = v >= FREE_VECTOR_BASE as usize && !SERVICED_VECTORS.contains(&(v as u8));
+            let (seg, off) = match free {
+                true => {
+                    let off = v - FREE_VECTOR_BASE as usize;
+                    wr8(mem, dummy + off, HLT);
+                    (BIOS_DUMMY_SEG, off as u16)
+                }
+                false => (TRAMP_SEG, (v * 2) as u16),
+            };
+            wr16(mem, v * 4, off);
+            wr16(mem, v * 4 + 2, seg);
         }
     }
 
     /// If CS:IP sits on a trampoline `HLT`, return the interrupt vector it fronts.
     pub fn trap_vector(&self, cs: u16, ip: u16) -> Option<u8> {
-        if cs == TRAMP_SEG && ip < 512 && ip % 2 == 0 {
-            Some((ip / 2) as u8)
-        } else {
-            None
+        match cs {
+            TRAMP_SEG if ip < 512 && ip % 2 == 0 => Some((ip / 2) as u8),
+            BIOS_DUMMY_SEG if ip < (256 - FREE_VECTOR_BASE as u16) => {
+                Some(ip as u8 + FREE_VECTOR_BASE)
+            }
+            _ => None,
         }
     }
 
@@ -280,6 +367,30 @@ impl MiniDos {
     pub fn max_free_block(&self, mem: &[u8]) -> u16 {
         let mut seg = ARENA_START;
         let mut best = 0u16;
+        loop {
+            let l = lin(seg, 0);
+            let sig = rd8(mem, l);
+            let block_owner = rd16(mem, l + 1);
+            let block_size = rd16(mem, l + 3);
+            if block_owner == 0 {
+                best = best.max(block_size);
+            }
+            if sig == b'Z' {
+                return best;
+            }
+            seg = seg + 1 + block_size;
+        }
+    }
+
+    /// Size in paragraphs of the largest single free block in the arena. DOS
+    /// hands a `.COM` the largest block it has rather than a round 64 KB, and
+    /// a resident that took a big buffer (PMD86's 384 KB PCM arena) can leave
+    /// the best remaining block a few paragraphs short of 64 KB. Blocks are
+    /// coalesced on free, so the largest single block is also the most `alloc`
+    /// can satisfy.
+    pub fn largest_free(&self, mem: &[u8]) -> u16 {
+        let mut seg = ARENA_START;
+        let mut best = 0;
         loop {
             let l = lin(seg, 0);
             let sig = rd8(mem, l);
@@ -444,14 +555,72 @@ impl MiniDos {
         wr8(mem, p + 0x81 + n, 0x0D);
     }
 
+    /// Allocate and fill the environment block DOS hands a child process.
+    ///
+    /// Layout is exactly MS-DOS's: the variable strings (each ASCIIZ), one more
+    /// NUL closing the list, a `0x0001` count word, then the program's own path
+    /// as ASCIIZ. The block is owned by `owner` so the program can free it.
+    ///
+    /// This is not decoration. A program that wants to know where it was loaded
+    /// from walks this layout — scan for the `\0\0` that ends the variable list,
+    /// copy what follows into its PSP, then release the block. With PSP:0x2C
+    /// left at zero that walk starts from segment 0xFFFF, reads a garbage block
+    /// length out of `[0xFFFF:0003]`, and `rep movsb`s kilobytes of nonsense
+    /// over the program's own code. FUGA System's OPNDRV 2.04 and later do
+    /// precisely this, and so overwrote themselves and fell into the PSP's
+    /// INT 20h instead of going resident — 27 sets that never played a note.
+    ///
+    /// Keep the block tight: the copy length is whatever remains of it after
+    /// the variable list, and the destination is inside the caller's PSP.
+    fn alloc_env(&self, mem: &mut [u8], owner: u16, path: &str) -> Option<u16> {
+        let mut env: Vec<u8> = Vec::new();
+        env.extend_from_slice(b"COMSPEC=C:\\COMMAND.COM\0");
+        env.push(0); // end of the variable list
+        env.extend_from_slice(&[0x01, 0x00]); // trailing-name count
+        env.extend_from_slice(path.as_bytes());
+        env.push(0);
+        let paras = env.len().div_ceil(16) as u16;
+        let seg = self.alloc(mem, paras, owner)?;
+        let base = lin(seg, 0);
+        for b in &mut mem[base..base + paras as usize * 16] {
+            *b = 0;
+        }
+        mem[base..base + env.len()].copy_from_slice(&env);
+        Some(seg)
+    }
+
     // ---- program loaders ------------------------------------------------
 
     /// Load a `.COM` image: PSP + image at PSP:0x100, all segregs = PSP,
     /// SP just below the 64 KB (or block) top. Returns the PSP segment.
-    pub fn load_com(&mut self, cpu: &mut dyn X86Cpu, image: &[u8], tail: &[u8]) -> anyhow::Result<u16> {
-        // A .COM wants a full 64 KB segment; allocate the largest block we can,
-        // capped at 0x1000 paragraphs (64 KB), like DOS hands a COM everything.
-        let need = 0x1000u16; // 64 KB in paragraphs
+    pub fn load_com(
+        &mut self,
+        cpu: &mut dyn X86Cpu,
+        name: &str,
+        image: &[u8],
+        tail: &[u8],
+    ) -> anyhow::Result<u16> {
+        // The environment goes below the PSP, as DOS builds it: copied first,
+        // then the program loaded above it. Owner is patched to the PSP once we
+        // have one (a zero owner would mark the block free and hand it straight
+        // back to the .COM allocation below).
+        let env_seg = self
+            .alloc_env(cpu.mem(), ENV_PENDING_OWNER, &program_path(name, "COM"))
+            .ok_or_else(|| anyhow::anyhow!("out of memory building environment for {name:?}"))?;
+        // A .COM wants a full 64 KB segment, but DOS hands it the largest free
+        // block and no more. Demanding a round 0x1000 paragraphs turns a block
+        // that is merely a little short into a spurious "out of memory":
+        // Grounseed's P86DRV takes a 384 KB PCM buffer and leaves 0xFF8 — 128
+        // bytes under 64 KB, and ample for the 1.8 KB stub that failed there.
+        let need = self.largest_free(cpu.mem_ref()).min(0x1000);
+        let room = need as usize * 16;
+        if room < 0x100 + image.len() + COM_MIN_STACK {
+            anyhow::bail!(
+                "out of memory loading .COM ({} bytes, largest free block {} bytes)",
+                image.len(),
+                room
+            );
+        }
         let psp_seg = self
             .alloc(cpu.mem(), need, 0)
             .ok_or_else(|| anyhow::anyhow!("out of memory loading .COM ({} bytes)", image.len()))?;
@@ -459,8 +628,8 @@ impl MiniDos {
         // Re-stamp the block's owner to itself (PSP).
         let mcb = psp_seg - 1;
         wr16(cpu.mem(), lin(mcb, 0) + 1, owner);
+        wr16(cpu.mem(), lin(env_seg - 1, 0) + 1, psp_seg);
 
-        let env_seg = 0; // no environment for now
         let mem_top = psp_seg + need;
         self.build_psp(cpu.mem(), psp_seg, mem_top, tail, env_seg);
 
@@ -475,7 +644,7 @@ impl MiniDos {
         self.dta = (psp_seg, 0x80);
         cpu.set_reg16(Reg16::Ds, psp_seg);
         cpu.set_reg16(Reg16::Es, psp_seg);
-        cpu.set_ss_sp(psp_seg, 0xFFFE);
+        cpu.set_ss_sp(psp_seg, (room.min(0x10000) as u16).wrapping_sub(2));
         // AX = 0 (both FCB drive checks "valid").
         cpu.set_reg16(Reg16::Ax, 0);
         cpu.set_cs_ip(psp_seg, 0x100);
@@ -484,7 +653,13 @@ impl MiniDos {
 
     /// Load an `.EXE` (MZ) image: parse the header, place the load module, apply
     /// relocations, set CS:IP / SS:SP from the (relocated) header. Returns PSP.
-    pub fn load_exe(&mut self, cpu: &mut dyn X86Cpu, image: &[u8], tail: &[u8]) -> anyhow::Result<u16> {
+    pub fn load_exe(
+        &mut self,
+        cpu: &mut dyn X86Cpu,
+        name: &str,
+        image: &[u8],
+        tail: &[u8],
+    ) -> anyhow::Result<u16> {
         if image.len() < 0x20 || &image[0..2] != b"MZ" {
             anyhow::bail!("not an MZ executable");
         }
@@ -506,6 +681,11 @@ impl MiniDos {
         }
         let load_size = image_size.saturating_sub(hdr_size);
 
+        // The environment goes below the PSP, as DOS builds it (see `alloc_env`).
+        let env_seg = self
+            .alloc_env(cpu.mem(), ENV_PENDING_OWNER, &program_path(name, "EXE"))
+            .ok_or_else(|| anyhow::anyhow!("out of memory building environment for {name:?}"))?;
+
         // Allocate PSP + load module + requested BSS.
         let load_paras = (load_size + 15) / 16;
         let need = (0x10 + load_paras + min_alloc) as u16; // PSP is 0x10 paras
@@ -514,10 +694,11 @@ impl MiniDos {
             .ok_or_else(|| anyhow::anyhow!("out of memory loading .EXE"))?;
         let mcb = psp_seg - 1;
         wr16(cpu.mem(), lin(mcb, 0) + 1, psp_seg);
+        wr16(cpu.mem(), lin(env_seg - 1, 0) + 1, psp_seg);
 
         let load_seg = psp_seg + 0x10; // program loads just past the PSP
         let mem_top = psp_seg + need;
-        self.build_psp(cpu.mem(), psp_seg, mem_top, tail, 0);
+        self.build_psp(cpu.mem(), psp_seg, mem_top, tail, env_seg);
 
         // Copy the load module.
         let dst = lin(load_seg, 0);
@@ -725,8 +906,8 @@ impl MiniDos {
             .resolve_program(name)
             .ok_or_else(|| anyhow::anyhow!("shell program {name:?} not found in set"))?;
         match kind {
-            ProgKind::Com => self.load_com(cpu, &image, tail.as_bytes())?,
-            ProgKind::Exe => self.load_exe(cpu, &image, tail.as_bytes())?,
+            ProgKind::Com => self.load_com(cpu, name, &image, tail.as_bytes())?,
+            ProgKind::Exe => self.load_exe(cpu, name, &image, tail.as_bytes())?,
         };
 
         let mut total: u64 = 0;
@@ -768,6 +949,7 @@ impl MiniDos {
             0x27 => return Some(ExecResult::Resident),
             0x21 => return self.int21(cpu),
             0x18 => self.int18(cpu),
+            0x1C => self.int1c(cpu),
             _ => {
                 *self.unimpl.entry((vec, ah(cpu))).or_default() += 1;
             }
@@ -783,6 +965,34 @@ impl MiniDos {
             // Key sense / read: no key available.
             0x00 | 0x01 => cpu.set_reg16(Reg16::Ax, 0),
             _ => {}
+        }
+    }
+
+    /// PC-98 timer BIOS (INT 1Ch) — the one-shot callback, and cancelling it.
+    ///
+    /// `AH=02` arms a far routine at `ES:BX` to be called once `CX` BIOS timer
+    /// ticks have passed; `AH=01` cancels a pending one. Packen Software's NL /
+    /// MUAPLAY / NAX drivers arm it with `CX=2` and then count iterations of a
+    /// tight loop until the routine fires, turning the result into the constant
+    /// their I/O busy-waits are sized from. With the call unserviced the routine
+    /// never fires and the driver counts forever — it never returns to DOS, let
+    /// alone goes resident.
+    ///
+    /// Only the delay's *order of magnitude* reaches the music: the constant
+    /// sizes busy-waits, while tempo comes off the OPN timer or the PIT. Other
+    /// `AH` values stay in the unimplemented tally rather than being guessed at.
+    fn int1c(&mut self, cpu: &mut dyn X86Cpu) {
+        match ah(cpu) {
+            0x02 => {
+                self.bios_timer = Some(BiosTimerReq::Arm {
+                    seg: cpu.reg16(Reg16::Es),
+                    off: cpu.reg16(Reg16::Bx),
+                    ticks: cpu.reg16(Reg16::Cx),
+                });
+                self.enable_irqs_on_return(cpu);
+            }
+            0x01 => self.bios_timer = Some(BiosTimerReq::Cancel),
+            f => *self.unimpl.entry((0x1C, f)).or_default() += 1,
         }
     }
 
@@ -912,6 +1122,16 @@ impl MiniDos {
                 let h = cpu.reg16(Reg16::Bx);
                 let count = cpu.reg16(Reg16::Cx) as usize;
                 let dst = lin(cpu.reg16(Reg16::Ds), cpu.reg16(Reg16::Dx));
+                // A handle nobody opened is an error, not an empty file. Callers
+                // branch on the carry to decide whether the data is there, and
+                // reporting success with zero bytes sends them on to parse
+                // whatever the buffer already held — VALKY_98 reads handle 7,
+                // misses the error, and hands the driver garbage.
+                if h >= FIRST_FILE_HANDLE && !self.handles.contains_key(&h) {
+                    cpu.set_reg16(Reg16::Ax, 0x0006); // invalid handle
+                    set_cf(cpu, true);
+                    return None;
+                }
                 let (data, start) = match self.handles.get(&h) {
                     Some(of) => match self.files.get(&of.name) {
                         Some(d) => (d.clone(), of.pos),
@@ -1045,6 +1265,16 @@ impl MiniDos {
     /// Return from a serviced software interrupt: pop IP/CS/FLAGS off the guest
     /// stack (as `IRET` would) but keep the CF/ZF our handler set as the DOS
     /// return status, restoring all other flags from the caller's saved image.
+    /// Set IF in the interrupt frame `iret_return` will restore, so a serviced
+    /// BIOS call can hand control back with interrupts enabled. Arming a timed
+    /// callback and returning with them still disabled would deadlock the
+    /// caller, which is why the real BIOS enables them here.
+    pub fn enable_irqs_on_return(&self, cpu: &mut dyn X86Cpu) {
+        let base = lin(cpu.reg16(Reg16::Ss), cpu.reg16(Reg16::Sp)) + 4;
+        let flags = rd16(cpu.mem_ref(), base) | hoot_cpu::flag::IF;
+        wr16(cpu.mem(), base, flags);
+    }
+
     pub fn iret_return(&self, cpu: &mut dyn X86Cpu) {
         let ss = cpu.reg16(Reg16::Ss);
         let sp = cpu.reg16(Reg16::Sp);
@@ -1135,7 +1365,7 @@ mod tests {
 
         let (img, kind) = dos.resolve_program("pmd_98").unwrap();
         assert_eq!(kind, ProgKind::Com);
-        let psp = dos.load_com(&mut cpu, &img, b"/K /M8").unwrap();
+        let psp = dos.load_com(&mut cpu, "pmd_98", &img, b"/K /M8").unwrap();
 
         // CS:IP at PSP:0x100, all segregs = PSP.
         assert_eq!(cpu.reg16(Reg16::Cs), psp);
@@ -1149,6 +1379,161 @@ mod tests {
         assert_eq!(cpu.mem_ref()[lin(psp, 0x80)], 6);
         assert_eq!(&cpu.mem_ref()[lin(psp, 0x81)..lin(psp, 0x87)], b"/K /M8");
         assert_eq!(cpu.mem_ref()[lin(psp, 0x87)], 0x0D); // CR terminator
+    }
+
+    /// A resident that took a large buffer leaves the arena's best block short
+    /// of a round 64 KB. DOS still loads a `.COM` there — it hands out the
+    /// largest block it has. Grounseed's PMD86 chain left 0xFF8 paragraphs and
+    /// the 1.8 KB stub after it failed with "out of memory", silencing 83
+    /// titles that were otherwise ready to play.
+    /// Drivers branch on the carry after AH=3Fh to decide whether the data
+    /// arrived. Reporting success with zero bytes for a handle nobody opened
+    /// takes them down the "it worked" path with an untouched buffer: VALKY_98
+    /// reads handle 7, misses the error, hands the garbage to its driver and
+    /// dies before installing its INT 7Fh vector. Handles 0-4 are the ones DOS
+    /// always has open, and an empty read of those is legitimate.
+    /// A PC-98 leaves unclaimed vectors pointing at the BIOS dummy in segment
+    /// 0xFFF0, and drivers read that back to find a vector nobody owns.
+    /// MAGIC_98 asks for INT EFh, sees our trampoline segment instead of the
+    /// BIOS, concludes EFh is taken and calls it — when its driver is on INT
+    /// 6Dh, which it never even looks at. Vectors we actually service still
+    /// have to look claimed.
+    #[test]
+    fn unserviced_vectors_read_back_as_the_bios_dummy() {
+        let dos = MiniDos::new();
+        let mut cpu = MockCpu::new();
+        dos.install_trampolines(cpu.mem());
+        let seg_of = |cpu: &MockCpu, v: usize| rd16(cpu.mem_ref(), v * 4 + 2);
+
+        for v in SERVICED_VECTORS {
+            assert_eq!(seg_of(&cpu, *v as usize), TRAMP_SEG, "INT {v:#04x} must look claimed");
+        }
+        for v in [0xEF, 0x6D, 0x7E, 0x60] {
+            assert_eq!(seg_of(&cpu, v), BIOS_DUMMY_SEG, "INT {v:#04x} must look free");
+        }
+        // Below the free range nothing moves: MUSIC.COM reads INT 48h and takes
+        // TRAMP_SEG as its "no resident copy" marker.
+        for v in [0x48, 0x0A, 0x5F] {
+            assert_eq!(seg_of(&cpu, v), TRAMP_SEG, "INT {v:#04x} is BIOS/DOS territory");
+        }
+        // The ROM's top — reset vector and machine ID — stays untouched.
+        assert!(cpu.mem_ref()[0xFFFF0..0x100000].iter().all(|b| *b == 0));
+        // Both kinds still trap, so the unimplemented tally keeps working.
+        assert_eq!(dos.trap_vector(TRAMP_SEG, 0x21 * 2), Some(0x21));
+        assert_eq!(dos.trap_vector(BIOS_DUMMY_SEG, 0xEF - 0x60), Some(0xEF));
+        assert_eq!(dos.trap_vector(0x1000, 0), None);
+    }
+
+    #[test]
+    fn reading_an_unopened_handle_is_an_error() {
+        let mut dos = MiniDos::new();
+        dos.add_file("SONG.DAT", vec![1, 2, 3, 4]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.set_handle(5, "SONG.DAT");
+
+        let read = |dos: &mut MiniDos, cpu: &mut MockCpu, h: u16| {
+            cpu.set_reg16(Reg16::Ax, 0x3F00);
+            cpu.set_reg16(Reg16::Bx, h);
+            cpu.set_reg16(Reg16::Cx, 0x10);
+            cpu.set_reg16(Reg16::Ds, 0x0800);
+            cpu.set_reg16(Reg16::Dx, 0);
+            dos.int21(cpu);
+            (cpu.reg16(Reg16::Ax), cpu.reg16(Reg16::Flags) & hoot_cpu::flag::CF != 0)
+        };
+        assert_eq!(read(&mut dos, &mut cpu, 5), (4, false), "a bound handle reads its file");
+        assert_eq!(read(&mut dos, &mut cpu, 7), (6, true), "an unopened handle is error 6");
+        assert_eq!(read(&mut dos, &mut cpu, 0), (0, false), "stdin is open and empty");
+    }
+
+    #[test]
+    fn com_loader_takes_a_block_short_of_64k() {
+        let mut dos = MiniDos::new();
+        dos.add_file("PMD_98.COM", vec![0x90, 0xC3]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+
+        // Eat the arena down to a single free block a few paragraphs under 64 KB.
+        let total = dos.largest_free(cpu.mem_ref());
+        let short = 0x1000 - 8;
+        dos.alloc(cpu.mem(), total - short - 1, 0x4321).unwrap();
+        assert_eq!(dos.largest_free(cpu.mem_ref()), short);
+
+        let (img, _) = dos.resolve_program("pmd_98").unwrap();
+        let psp = dos.load_com(&mut cpu, "pmd_98", &img, b"").unwrap();
+        // The stack sits at the top of what we actually got, not a presumed 64 KB.
+        assert_eq!(cpu.reg16(Reg16::Ss), psp);
+        assert!(cpu.reg16(Reg16::Sp) < 0xFFFE, "sp must not point past the block");
+        // PSP:0x02 is the first paragraph beyond the allocation.
+        let owned = rd16(cpu.mem_ref(), lin(psp - 1, 0) + 3);
+        assert_eq!(rd16(cpu.mem_ref(), lin(psp, 0x02)), psp + owned);
+        assert_eq!(cpu.reg16(Reg16::Sp), (owned as u32 * 16) as u16 - 2);
+    }
+
+    #[test]
+    fn com_loader_builds_a_real_environment_block() {
+        let mut dos = MiniDos::new();
+        dos.add_file("OPNDRV.COM", vec![0x90, 0xC3]);
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+
+        let (img, _) = dos.resolve_program("opndrv").unwrap();
+        let psp = dos.load_com(&mut cpu, "opndrv", &img, b"").unwrap();
+
+        // PSP:0x2C names a block below the program, owned by the PSP so the
+        // program can free it once it has copied what it wants out.
+        let env = rd16(cpu.mem_ref(), lin(psp, 0x2C));
+        assert!(env != 0 && env < psp, "env {env:#x} should sit below psp {psp:#x}");
+        assert_eq!(rd16(cpu.mem_ref(), lin(env - 1, 0) + 1), psp);
+
+        // Layout: variable strings, the NUL that closes the list, a 0x0001
+        // count word, then this program's own path. Drivers that relocate their
+        // path into the PSP scan for exactly the double NUL.
+        let size = rd16(cpu.mem_ref(), lin(env - 1, 0) + 3) as usize * 16;
+        let block = &cpu.mem_ref()[lin(env, 0)..lin(env, 0) + size];
+        let end = block.windows(2).position(|w| w == [0, 0]).expect("list terminator");
+        assert_eq!(&block[..end], b"COMSPEC=C:\\COMMAND.COM");
+        assert_eq!(&block[end + 2..end + 4], &[0x01, 0x00]);
+        let path = &block[end + 4..];
+        let path = &path[..path.iter().position(|&b| b == 0).unwrap()];
+        assert_eq!(path, b"C:\\OPNDRV.COM");
+    }
+
+    #[test]
+    fn timer_bios_arms_a_callback_and_re_enables_interrupts() {
+        let mut dos = MiniDos::new();
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        dos.install_trampolines(cpu.mem());
+        cpu.set_ss_sp(0x0900, 0x0100);
+        cpu.set_cs_ip(0x1234, 0x0056);
+
+        // The guest arms a one-shot: AH=02, ES:BX = routine, CX = ticks. It does
+        // so with interrupts disabled, which is why the BIOS must turn them back
+        // on — otherwise the callback it just armed could never be delivered.
+        cpu.set_reg16(Reg16::Ax, 0x0200);
+        cpu.set_reg16(Reg16::Es, 0x1005);
+        cpu.set_reg16(Reg16::Bx, 0x184D);
+        cpu.set_reg16(Reg16::Cx, 2);
+        cpu.interrupt(0x1C);
+        assert!(dos.service_int(&mut cpu, 0x1C).is_none());
+        assert_eq!(dos.bios_timer, Some(BiosTimerReq::Arm { seg: 0x1005, off: 0x184D, ticks: 2 }));
+
+        dos.iret_return(&mut cpu);
+        assert_ne!(cpu.reg16(Reg16::Flags) & hoot_cpu::flag::IF, 0);
+        assert_eq!(cpu.reg16(Reg16::Cs), 0x1234);
+        assert_eq!(cpu.reg16(Reg16::Ip), 0x0056);
+
+        // AH=01 cancels. It has to be posted as a request, not a clear: the
+        // harness drains this field every step, so by now the arm is long gone
+        // from here and only the engine's copy can still fire.
+        dos.bios_timer = None; // as the harness leaves it after picking the arm up
+        cpu.set_reg16(Reg16::Ax, 0x0100);
+        cpu.interrupt(0x1C);
+        assert!(dos.service_int(&mut cpu, 0x1C).is_none());
+        assert_eq!(dos.bios_timer, Some(BiosTimerReq::Cancel));
     }
 
     #[test]
@@ -1177,7 +1562,7 @@ mod tests {
         let mut dos = MiniDos::new();
         let mut cpu = MockCpu::new();
         dos.init_arena(cpu.mem());
-        let psp = dos.load_exe(&mut cpu, &img, b"").unwrap();
+        let psp = dos.load_exe(&mut cpu, "test", &img, b"").unwrap();
         let load_seg = psp + 0x10;
         // CS = load_seg + init_cs(0); relocated word == load_seg.
         assert_eq!(cpu.reg16(Reg16::Cs), load_seg);

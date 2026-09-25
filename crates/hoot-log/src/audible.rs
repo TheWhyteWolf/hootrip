@@ -163,7 +163,15 @@ impl Markers {
     /// produces nothing — a real and common shape in silent rips.
     fn ssg_ch_sounds(&self, ch: u8) -> bool {
         let d = self.ssg_level[ch as usize];
-        let amplitude = d & 0x0F != 0 || (d & 0x10 != 0 && self.ssg_env);
+        // Bit 4 is the mode select, and it wins: with it set the envelope
+        // generator drives amplitude and the fixed-level nibble is ignored by
+        // the hardware, so `0x18` is as silent as `0x10` until a shape is
+        // written. Reading the nibble first would let a driver that parks a
+        // channel at `0x18` and never writes reg 0x0D pass the gate.
+        let amplitude = match d & 0x10 != 0 {
+            true => self.ssg_env,
+            false => d & 0x0F != 0,
+        };
         amplitude && self.ssg_channel_live(ch)
     }
 
@@ -352,6 +360,16 @@ mod tests {
         // With no envelope shape ever written there is nothing to hear.
         // Observed in the wild ("Onryou Senki" tracks), which render to zero.
         let log = log_with(Chip::Ym2203, &[(0, 0x07, 0x18), (0, 0x0A, 0x10)]);
+        assert_eq!(audibility(&log), Audibility::Dead);
+    }
+
+    #[test]
+    fn ssg_envelope_mode_ignores_the_fixed_level_nibble() {
+        // 0x18: envelope mode, and a fixed level the hardware discards because
+        // bit 4 hands amplitude to the envelope generator. No shape was ever
+        // written, so this is as silent as a bare 0x10 — reading the nibble
+        // first would wave it through.
+        let log = log_with(Chip::Ym2203, &[(0, 0x07, 0x18), (0, 0x0A, 0x18)]);
         assert_eq!(audibility(&log), Audibility::Dead);
     }
 

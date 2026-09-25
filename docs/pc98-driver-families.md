@@ -202,7 +202,7 @@ was entirely this artifact.
 
 ---
 
-## 4. The remaining silent sets — a ranked queue
+## 7. The remaining silent sets — a ranked queue
 
 After the audibility gate landed (see [silent-rips](silent-rips.html)), the sets
 that produce *nothing* are countable rather than hidden in a pile of silent
@@ -310,7 +310,7 @@ the MCB chain, unimplemented DOS/INT calls, and the guest's console output.
 
 ---
 
-## 5. Plan for the sets that are still silent
+## 8. Plan for the sets that are still silent
 
 After the INT 14h fix, **75 sets / 2,084 tracks** recovered and **268 sets /
 5,518 titles** remain silent (MIDI/GS variants excluded — those are not
@@ -388,3 +388,668 @@ Read in this order: which vectors got hooked, `sound vector`, `timer IRQs`,
 unimplemented-call tally and the guest's console output. The five signatures
 above are each visible in those lines alone.
 
+
+---
+
+## 9. Signature A, worked through
+
+Signature A was "the driver calls an interrupt the harness does not service".
+That held, but the *interrupt* turned out to be a symptom in every case, not the
+cause — and the two clusters had nothing in common beyond the symptom. Three
+separate defects, all in the DOS/BIOS re-host rather than in any driver family:
+
+| defect | what it broke | sets | titles |
+|---|---|---:|---:|
+| no environment block (`PSP:0x2C = 0`) | FUGA OPNDRV 2.04+ overwrote its own code | 27 | 418 |
+| PC-98 timer BIOS (INT 1Ch) unserviced | Packen NL / MUAPLAY calibration never ended | 9 | 167 |
+| no sound-BIOS ROM (`dummysndrom`) | FUGA OPNDRV 1.23 and others found no board | 4 | 125 |
+
+Two sets are left in A, both **OPNA variants whose OPN twin already rips**:
+`sakura_k_98` and `majokko_98` run NAX 6.26, whose OPNA path is **80386 code**
+(`push edx`, `push fs` at NAX.COM:12A9). The i286 core traps it as an invalid
+opcode ~2M times. Fixing that means an i386 core, not a driver change.
+
+### A.1 — The environment block
+
+`fgplay_h` presented as `INT 0xd2 AH=0x00 ×1,142,859`: a spin. The spin is
+`fgplay_h.com` at 0x14A, polling the driver's status call until it reports
+ready, which can never happen because the driver is not resident. The stub was
+never the problem.
+
+`OPNDRV.COM` **2.04 and later** copy their own program path out of the
+environment block and into their PSP, so it survives the block being freed:
+
+```asm
+mov  ah,0x30 / int 0x21   ; DOS 3+?
+mov  bx,[0x2c]            ; the environment segment
+dec  bx / mov es,bx       ; its MCB
+mov  cx,[es:3] / shl cx,4 ; block size in bytes
+repne scasb / dec cx / scasb / jnz  ; find the \0\0 ending the variable list
+rep  movsb                ; copy what follows into the PSP
+```
+
+With `PSP:0x2C = 0` — which is what `load_com` wrote, `// no environment for
+now` — `dec bx` makes `ES = 0xFFFF`, the size comes from `[0xFFFF:0003]`, and
+`rep movsb` copies ~9,500 bytes of low memory over the program's own code.
+OPNDRV then falls into the PSP's `INT 20h` and terminates, which the diagnostic
+reported as `opndrv -> Terminated(0)` with no hooked `INT D2h`.
+
+Versions **2.03 and earlier do not have this code**, which is exactly why 5 of
+the 32 `fgplay_h` sets always worked and 27 never did. Version, not game:
+
+| OPNDRV | before | after |
+|---|---|---|
+| 1.23, 1.32, 2.00, 2.02, 2.03 | Resident | Resident (unchanged) |
+| 2.04, 2.05, 2.06 | **Terminated(0)** | **Resident** |
+
+`MiniDos::alloc_env` now builds the real thing — variable strings, the NUL that
+closes the list, a `0x0001` count word, the program's path — allocates it below
+the PSP as DOS does, and stamps the PSP as its owner so `AH=49h` can free it.
+Rendered through `vgm2wav`, 20 tracks sampled across 5 of the recovered sets
+peak at −6 to −19 dBFS; none is silent.
+
+### A.2 — The PC-98 timer BIOS
+
+Packen Software's NL 1.32 / MUAPLAY 1.21 / NAX size their I/O busy-waits by
+measuring the machine: arm a one-shot callback, count iterations of a tight loop
+until it fires, keep the count.
+
+```asm
+mov ah,2 / mov cx,2 / mov bx,0x184d / push cs / pop es / int 0x1c
+inc word [0x2124] / mov cx,0x10 / loop $      ; count
+cmp byte [0x2126],0 / jz  ...                 ; until the callback sets the flag
+```
+
+`INT 1Ch` is the PC-98 **timer BIOS**, and it was unserviced, so the flag never
+set and the driver counted forever — `nl -> RanToBudget`, nothing installed.
+
+Two things were needed. `MiniDos::int1c` records the request, and the harness
+turns it into a cycle deadline and enters the routine as an interrupt (`enter_far`
+— `X86Cpu::interrupt` only dispatches through the IVT, and a BIOS callback has no
+vector). And the call must **return with interrupts enabled**: the driver arms the
+one-shot with `IF` clear, so a BIOS that returned as it was called could never
+deliver what it had just armed. `enable_irqs_on_return` sets `IF` in the frame the
+trampoline's `IRET` restores.
+
+The tick is modelled at 100 Hz. Only its order of magnitude reaches the music —
+the constant sizes busy-waits; tempo comes off the OPN timer or the PIT.
+
+All 9 sets install and play: `nl` ×5 (Spread, Outer Formula, CRW Metal Jacket,
+Magic Master, Block Quest V) and `MUAPLAY` ×4 (Kids SAP, Quintia Road, Wrestle
+Angels, Presence), 45–239 key-ons each over a 3.2–5.0 s window.
+
+### A.3 — `dummysndrom`
+
+A real PC-9801-26K/86 board carries a BIOS ROM, and software that drives the
+board through it asks the ROM which software interrupt it serves. hoot maps a
+stand-in for the 76 sets that ask (`<option name="dummysndrom" value="1"/>`);
+the harness mapped nothing, so OPNDRV 1.23 read zero, concluded there was no
+sound board, and kept an 80-byte stub resident instead of the driver:
+
+```asm
+mov ax,0xcee0 / mov es,ax / mov al,[es:4]   ; the sound BIOS's interrupt number
+mov [0x142],al
+cmp byte [0x142],0xd2 / jnz <no board>
+```
+
+We model that one byte, the only field we have direct evidence a driver reads,
+rather than inventing ROM contents — a set that probes something else stays
+visibly silent instead of quietly wrong. It recovers Beat Vice, Imadoki Junjyou
+Monogatari, Zark Legend Special and Amida Extra (125 titles). Yoshitsune gets as
+far as 1,429 timer IRQs and a full-length write span but still no key-on, and
+the `odq_98` sets (Deflektor, Majoriko, H-Go! Yeah!) are unchanged — those fail
+for other reasons.
+
+### A.4 — Validation
+
+Ripped in full and rendered through `vgm2wav`: **261 of 263 tracks across the 13
+sets A.2 and A.3 recovered are audible**, −1.8 to −21.6 dBFS. The two exceptions
+are `音色定義` timbre-definition pseudo-tracks (Outer Formula `NEIRO_2.O`, CRW
+Metal Jacket `MJ_00.O`) — 95 writes, 60-odd registers programmed, nothing keyed
+on, silent by design. The gate calls them `dead` and drops them; finding them in
+the output is what surfaced the `pc98-rip` gate gap recorded in
+[silent-rips](silent-rips.html) §2.
+
+For the `fgplay_h` sets, 20 tracks sampled across 5 of the 27 peak at −6 to
+−19 dBFS with none silent.
+
+**Control: 70 previously-working sets, one from each of ~50 stub families, all
+14 titles or fewer, re-ripped in full and compared against the promoted library
+on the dump-region identity `hootrip triage` records.** 688 tracks, 100%
+audible, **609 byte-identical**. The 79 that differ fall in 7 sets:
+
+| set | delta | what changed |
+|---|---:|---|
+| AD&D Dragon Strike (OPN) | +0.063% | the intended `dummysndrom` init (`00 07 bf` now leads the stream) |
+| ESP, Ekudorado (86), Kara no Naka no Kotori, Poison Needle (OPNA), Ryuou Sangokushi, Touhou Reiiden (OPNA) | ≤0.005% | one-tick wait rounding |
+
+The rounding is a 1 ms `0xFF`/`0xFE` wait landing on the other side of a
+register write — `00 28 f5 FF 00 a4 0c` where the library has
+`00 28 f5 00 a4 0c FF`, or `FE 0a FE 0b` where it has `FE 0b FE 0a`. Same
+events, same order, same total elapsed time; the environment block moves every
+PSP three paragraphs, which shifts the setup phase by a few cycles. Durations
+are identical and peaks match within 0.4 dB throughout.
+
+**A trap in reading that comparison.** Three library folders hold tracks from
+more than one catalogue entry, because distinct archives render to the same
+display name: `dang_98` (8 titles) and `dang2_98` (39) both write to
+`[PC-9801] Hana Yori Dango 2 (OPN)`, and `fm_variant_game_name` maps a set's
+GS/MT-32 entries onto its `(OPN)` folder as well. A control that rips one entry
+and diffs the folder reports the other entry's tracks as missing. That is the
+79 "missing" in this run, and it is not a rip failure.
+
+---
+
+## 10. Where the queue stands after signature A
+
+Measured 2026-09-16 by re-ripping every pc98dos archive that was entirely
+silent in the promoted library (`archive-rip --only-archives`, 15 s captures —
+enough to tell audible from silent, not a library rip), then re-running the
+recovered subset against the pre-signature-A build to attribute the gains.
+
+**337 OPN-family sets were silent at promotion. 111 now produce audio (2,511
+titles); 226 remain (4,731 titles).** Split by cause:
+
+| | sets | titles |
+|---|---:|---:|
+| the INT 14h sound-vector fix (before today) | 70 | 1,820 |
+| signature A (environment block, INT 1Ch, `dummysndrom`) | 41 | 691 |
+
+Signature A's 691 breaks down as `fgplay_h` 28 sets / 470, `nlp_hoot` 9 / 165,
+and 4 sets / 56 titles elsewhere that the `dummysndrom` byte unblocked
+(`zark_98`, `yositune`, `imado_98`, `amidaex`).
+
+**Do not read the INT 14h fix's reach as signature A's.** That fix alone
+accounts for `pmd_98`'s 461 recovered titles, `mxj_98`'s 131 and `fmxp`'s 127 —
+families signature A never touched. Comparing a fresh sweep against the
+promoted library conflates the two, because the library predates both.
+
+### What remains
+
+| stub | sets | titles | signature |
+|---|---:|---:|---|
+| `valky_98` | 11 | 398 | B — PIT hooked but not ticking |
+| `pmd_98` | 9 | 357 | D — sequencing real music, no voice ever programmed |
+| `emd_98` | 12 | 218 | C — activity finishes before the capture opens |
+| `fmxp` | 14 | 216 | — |
+| `usmd` | 7 | 208 | — |
+| `usd_98` | 12 | 208 | — |
+| `odq_98` | 5 | 192 | — |
+| `magic_98` | 12 | 185 | — |
+| `cplay98` | 10 | 156 | — |
+| ~20 more | 134 | 2,593 | — |
+
+**§11 supersedes the `pmd_98` and `fmxp` rows.** Both split on the PC-9801-86
+board, not on the family: `pmd_98`'s 9 sets and 9 of `fmxp`'s 14 are gone from
+this queue. `valky_98` is what the order should follow now.
+
+Two cautions carried forward from today, both now with a second data point:
+
+- **The stub still does not predict the failure.** `fgplay_h` split on the
+  *driver version* inside it (OPNDRV ≤2.03 worked, ≥2.04 never did);
+  `nlp_hoot` split into three unrelated causes; and `fmxp` and `pmd_98` now sit
+  on *both* sides of the line — 9 `fmxp` sets recovered and 14 did not.
+  Re-diagnose before grouping.
+- **Fixing the re-host beats fixing a family.** Every gain above came from the
+  DOS/BIOS layer — a vector, an environment block, a BIOS call, a ROM byte —
+  and each one reached sets nobody was aiming at. `cplay98` and `usd_98`
+  appearing here at all is the same signal in reverse: supported families
+  failing on a subset, which has so far always meant a per-set binding
+  difference rather than a missing capability.
+
+---
+
+## 11. The PC-9801-86 board, worked through
+
+Signature D was filed as "voice data never loaded" on the strength of a
+`pmd_98` set that sequenced real music and classified `NoVoice`. It was not a
+voice-binding problem, and `pmd_98` was not the unit of work. Re-bucketing the
+sweep by **machine kind** and by **whether a set's same-archive twin rips**
+found the real boundary in one pass:
+
+| still-silent sets | sets | titles |
+|---|---:|---:|
+| a twin in the same archive folder rips | 24 | 716 |
+| …of which kind `86` | 22 | 653 |
+| no working twin | 202 | 4,015 |
+
+All nine remaining `pmd_98` sets were the **`(86)`** variant of a set whose
+`(OPN)` twin already ripped — `imd_4_98` had a working `(OPNA)` twin too. Same
+driver binary, same song data, same harness configuration (kinds `86` and
+`opna` are folded together everywhere: same chip, clock, ports and S98 device).
+Only the *shell chain* differed, and the 86 chain pulls in the board's PCM
+driver. Two defects were hiding behind that, and neither is a driver-API gap.
+
+### 11.1 — The PCM FIFO that never filled
+
+PMD86's IRQ handler polls the 86 board's PCM control register:
+
+```asm
+2E53  mov dx,0xa468
+      in  al,dx
+      test al,0x10     ; bit 4: "the FIFO wants more data"
+      jz  0x2e60       ; clear -> go sequence the FM chip
+      call 0x677       ; set   -> push another block
+      jmp 0x2e53
+```
+
+`0xA468` had no read arm, so it returned the unmodelled-port default of `0xFF`
+— bit 4 permanently set. The driver refilled a FIFO that never filled and never
+reached the FM sequencer: **860,060 reads of one port** in a five-second
+capture, 117 FM writes, a 1 ms write span.
+
+The 86 board's PCM is a separate DAC with no S98 or VGM device to carry it, so
+the honest model is a FIFO that never starves — `PCM86_FIFO_REQ` always reads
+clear. The driver skips its PCM feed and gets on with the FM, which is the part
+we can log. Writes to `0xA468` are now retained so the driver's
+read-modify-write rate and FIFO-reset updates see their own bits back, and the
+rest of `0xA461..0xA46F` reads as 0 rather than falling through to 0xFF — a
+driver polling any of them for a flag should see "nothing pending", not "every
+bit set". Same set afterwards: 18,848 FM writes, 472 key-ons, the full 5 s.
+
+### 11.2 — A `.COM` that would not fit in 65,408 bytes
+
+Grounseed then failed one step later, on its own stub:
+
+```
+pmd_98  -> Error("out of memory loading .COM (1805 bytes)")
+```
+
+with 63 KB free. `load_com` asked the arena for a round `0x1000` paragraphs —
+its own comment said "allocate the largest block we can", but the code demanded
+exactly 64 KB. Grounseed's `P86DRV /24` takes a 384 KB PCM buffer, leaving a
+largest free block of `0xFF8` paragraphs: 128 bytes under 64 KB, and ample for
+a 1.8 KB stub. DOS hands a `.COM` the largest block it has, so the loader now
+does too, and parks SP at the top of what it actually got instead of a presumed
+`0xFFFE`. That is a general DOS-layer fix; it happened to surface here because
+the 86 chains are the ones that allocate big buffers.
+
+### 11.3 — Result
+
+Re-swept all 337 previously-silent OPN-family sets against the pre-fix build:
+
+**24 sets recovered, 595 of their 742 titles, 0 regressions and 0 title-count
+changes anywhere else.**
+
+| stub | sets | titles | |
+|---|---:|---:|---|
+| `pmd_98` | 9 | 298 | all of signature D's remainder |
+| `fmxp` | 9 | 127 | the `(86)` half of the split noted in §10 |
+| `klp_hoot` | 2 | 86 | |
+| `rhymes98` | 1 | 33 | |
+| `fmxpb` | 2 | 26 | |
+| `pmp_hoot` | 1 | 25 | |
+
+Two independent checks on the other side of the ledger:
+
+- 41 of 41 sampled recovered tracks render through libvgm at −0.0 to −15.0 dBFS,
+  so the audibility call is not just our own classifier agreeing with itself.
+- The 70-set control from §9.4 — all audible before this change, one of them an
+  `86`-kind set — re-ripped at full length: **688 of 688 tracks byte-identical**.
+  Unlike the environment-block work, this change moves nothing in a set that was
+  already playing: the new `0xA461..0xA46F` read arms only fire on ports that
+  previously counted as unmodelled, and the loader takes the same round `0x1000`
+  paragraphs whenever the arena has them.
+
+### 11.4 — What is left of the 86 kind
+
+6 sets / 239 titles, and none of them are 86-board problems — the diagnostic
+puts each in a signature that has nothing to do with the board:
+
+| set | titles | signature |
+|---|---:|---|
+| `valkyrie_98`, `mariner_98`, `injuda_98` | 192 | B — `VALKY_98` runs to budget or exits; PIT not ticking |
+| `v_btr_98`, `v_ctr_98` | 35 | FMX/FMXP run to budget |
+| `msw98` | 12 | `puzp` runs to budget |
+
+**The queue after this work: 202 sets / 3,989 titles.** `valky_98` (signature B)
+is now both the largest single bucket and the only thing standing between us and
+the last of the 86 sets, which moves it up the order.
+
+One loose end noted while mapping the board and left alone: a write to `0xA460`
+is interpreted as the OPNA "extend" bit, and a driver writing a PCM mode byte
+with bit 0 clear would silently disable bank-1 readback. No set is known to do
+it; worth remembering if bank-1 status polling ever stalls a set that otherwise
+looks healthy.
+
+---
+
+## 12. Signature B, and the DOS call that hid it
+
+Signature B was filed as "PIT hooked but not ticking": `valky_98` hooks INT 08h,
+0Bh, 50h and B0h, `opn timer used: false`, exactly one timer IRQ. The diagnostic
+also reported `funcvect: -`, which read as "this family has no stub". Both
+readings were downstream of something simpler.
+
+`VALKY_98.COM` **is** a stub — 806 bytes that load `CSCP.BIN` from handle 5,
+patch it, start it, and then install INT 7Fh and idle:
+
+```asm
+01FD  mov dx,0x210
+0200  mov ax,0x257f     ; set INT 7Fh -> cs:0x210
+0203  int 21h
+0205  mov dx,0x7e8
+0208  mov al,0x81       ; EXT_STATE = STUB_READY
+020A  out dx,al
+020B  sti
+020C  hlt
+020D  jmp 0x20c
+```
+
+It never got there. The shell chain reported `Terminated(0)`, and the trace put
+the exit at `INT 20h` executed from PSP:0000 — a `.COM` falling off the end of
+its own stack. Walking the INT 21h sequence backwards, termination followed
+immediately after this:
+
+```asm
+01DD  mov bx,0x7        ; handle 7 — nothing in this set binds it
+01E0  mov ah,0x3f
+01E2  int 21h
+01E4  jc  0x1f9         ; error -> skip the play call, install INT 7Fh, idle
+```
+
+`AH=3Fh` on a handle nobody opened returned **success with zero bytes**. The
+carry stayed clear, so the stub took the "the data is here" branch and handed
+its driver a buffer it had never filled; the driver returned into the weeds and
+the program died before reaching the line that makes it a stub. Real DOS returns
+CF=1 with AX=6, *invalid handle*. Handles 0-4 are the ones DOS always has open,
+and an empty read of those is a legitimate EOF — so the error is scoped to
+handles 5 and up.
+
+One line, and every `valky_98` set in the queue came back: **8 sets / 177 titles**
+(the remaining three are the `(SC-88)` MIDI variants, which were never
+candidates — note that the MIDI exclusion lists used for these measurements
+match `(SC-55` but not `(SC-88`). 16 of 16 sampled tracks render at −2.3 to
+−17.8 dBFS.
+
+The lesson is the one from §10 again, sharper: **`funcvect: -` and "the PIT is
+not ticking" were both symptoms of a DOS call answering wrongly two steps
+earlier.** Read the shell chain's outcome before reading the capture — a stub
+that reports `Terminated` never installed anything, so nothing downstream of it
+means what it appears to mean.
+
+### Where the queue stands
+
+Three changes in this pass — the 86-board PCM FIFO, the `.COM` allocation, and
+the unopened-handle error — total **32 sets / 772 titles**, with no regression
+and no title-count change anywhere in the 337-set sweep.
+
+| stub | sets | titles | signature |
+|---|---:|---:|---|
+| `emd_98` | 12 | 218 | C — activity finishes before the capture opens |
+| `usmd` | 7 | 208 | — |
+| `usd_98` | 12 | 208 | — |
+| `odq_98` | 5 | 192 | — |
+| `magic_98` | 12 | 185 | — |
+| `cplay98` | 10 | 156 | — |
+| `synup_98` | 6 | 112 | — |
+| `ss_98` | 5 | 107 | — |
+| `muse_98` | 6 | 106 | — |
+| ~30 more | 114 | 2,156 | — |
+
+**194 sets / 3,650 titles**, of which only 5 sets still have a working twin in
+the same archive folder — the strongest single hint left, and the one that
+caught both of the last two signatures. Signature C (`emd_98`) leads the queue.
+
+### 12.1 — What the handle change costs
+
+The 70-set control is not byte-clean this time, and it should not be: making a
+DOS call answer differently changes the cycle count of every program that makes
+it. **630 of 688 tracks are byte-identical; 58 differ, across 5 sets.**
+
+The cause is visible in one line of the diagnostic. For Touhou Reiiden the
+entire before/after delta is:
+
+```
+-    pmd_98   -> StubReady  (1543 cyc)
++    pmd_98   -> StubReady  (1523 cyc)
+```
+
+`PMD_98.COM` probes a handle this set does not bind. The probe now returns an
+error immediately instead of walking the zero-byte copy path, so the stub is
+ready 20 cycles sooner and the capture opens at a slightly different point in
+the driver's timer phase.
+
+What that does to the music, measured rather than assumed:
+
+- **39 of the 58** have a **register-write sequence identical to the old rip** —
+  only the wait lengths between writes moved.
+- The other 19 additionally reorder **6 to 36 writes out of 224,000-384,000**
+  (0.003-0.01%), always adjacent updates landing either side of a timer tick.
+- Durations are identical to 0.1 s and peak levels agree within 0.3 dB on every
+  track sampled.
+
+This is the same effect the §9.4 control saw when the PSP moved three
+paragraphs, from a different cause. It is worth restating why it is acceptable
+here: the old answer was **wrong**. A read of a handle nobody opened is an
+error in DOS, and every program that branches on that carry was being lied to.
+Trading a 0.01% phase shift in five sets for eight sets that could not play at
+all is the right side of that trade — but the shift is real, and a rip made
+before this change will not hash-match one made after.
+
+---
+
+## 13. Signature C — not a capture window, a filename
+
+`emd_98` looked like the capture opening too late: the driver alive with 478
+timer IRQs, 839 FM writes, but **1 write captured**, a 10 ms span and no
+key-ons. The stub settles it in 144 bytes:
+
+```asm
+0147  mov dx,0x180
+014A  mov cx,0xffff
+014D  mov ah,0x3f
+014F  xor bx,bx
+0151  int 21h            ; read handle 0 into cs:0x180
+0153  jc  0x16d
+0155  mov bx,ax          ; bx = bytes read
+0157  mov byte [bx+0x180],0   ; NUL-terminate it
+015C  mov ah,0x1
+015E  int 0xd2           ; EMD "load song file"
+0160  cmp al,0
+0162  jnz 0x13c          ; failed -> return without playing
+0164  mov ah,0x3
+0166  int 0xd2           ; play
+```
+
+Writing a NUL at the byte count you just read back is only meaningful for a
+**string**. `emd_98` is a third `opens_by_name` family: handle 0 carries the
+song's *filename*, and the set's gamelist says so — every `.EMI` is a `file` rom
+at `offset="-1"` (materialized, never handle-bound) with a matching **`conin`**
+rom at the title code. Handed the file's content instead, `INT D2h AH=1` fails,
+the stub takes its `jnz` exit, and what is left is the timer the previous call
+started, ticking over a driver with no song. That is the "1 write in 10 ms" —
+not a window problem at all.
+
+Adding the `emd_98` shell prefix to `opens_by_name` recovers **all 12 sets, 217
+of 218 titles**, 18 of 18 sampled tracks at −0.3 to −16.5 dBFS. Nothing else in
+the 337-set sweep changed by a single title, which is what a prefix-scoped
+change should look like.
+
+That makes **four** families now found to open the song by name — cplay98/FPLAY,
+MUSDRV/mbmusp, MDRV acidplan, and EMD. §1 called this "the central discovery of
+this campaign"; it has now outlived three separate re-diagnoses, and is worth
+checking early whenever a stub reads handle 0 and the driver then reports
+failure.
+
+### Where the queue stands after this pass
+
+Four changes today — the 86-board PCM FIFO, the `.COM` allocation, the
+unopened-handle error and the `emd_98` filename — recover **44 sets / 989
+titles**, with no regression anywhere in the sweep.
+
+| stub | sets | titles |
+|---|---:|---:|
+| `usmd` | 7 | 208 |
+| `usd_98` | 12 | 208 |
+| `odq_98` | 5 | 192 |
+| `magic_98` | 12 | 185 |
+| `cplay98` | 10 | 156 |
+| `synup_98` | 6 | 112 |
+| `ss_98` | 5 | 107 |
+| `muse_98` | 6 | 106 |
+| `muspj_98` | 7 | 90 |
+| ~35 more | 112 | 1,946 |
+
+**182 sets / 3,432 titles remain**, and the five signatures of §8 are spent:
+every one of them turned out to be a DOS or board-level defect rather than the
+driver-API gap it was filed as. `cplay98` appearing in the list above is the
+next thing worth pulling on — it is a *supported* family failing on 10 sets,
+which has so far always meant a per-set binding difference.
+
+---
+
+## 14. Read the guest's console — it was being thrown away
+
+`Pc98RipOutcome::console` came from `String::from_utf8_lossy`. A PC-98 guest
+writes **Shift_JIS**, so every Japanese message a driver printed arrived as a
+row of replacement characters, and the diagnostic's most direct evidence — the
+driver saying in words why it gave up — was unreadable. Decoding it properly
+(and stripping the ANSI colour escapes the guests pepper it with) changed the
+remaining queue from twenty near-identical "StubReady, no writes" rows into
+this:
+
+| stub | titles | what the guest says |
+|---|---:|---|
+| `usd_98` | 208 | *(harness)* `missing file ILM_03.USO` — a set file absent from the archive folder |
+| `odq_98` | 192 | 「サウンドボードがありません！」 — "there is no sound board" |
+| `magic_98` | 185 | 「音色が指定されていません」 — "no timbre specified", then resident |
+| `cplay98` | 156 | 「常駐に失敗しました。割込み設定をＩＮＴ５に変更してください。」 — "failed to stay resident; change the interrupt setting to INT 5" |
+| `synup_98` | 112 | 「内蔵音源ボード(FM6,0188H)」 then `Abnormal program termination` |
+| `muse_98` | 106 | `MUSE2 Ver 2.2 installed.` — healthy; its API sits on **INT 05h**, which nothing services |
+| `magpa_98` | 77 | 「MPU-PC98 インターフェイスチェック中」 — stalls probing for MIDI |
+| `mfd_98` | 69 | `Abnormal program termination` |
+| `usmd` | 208 | 「USMD APIが使用可能です」 — resident and healthy; 4 unserviced `INT 7Eh AH=0` |
+
+Two of those name the same missing capability from opposite directions:
+`cplay98`'s FPLAY Ver.0 *asks* for the OPN IRQ jumper to select INT 5, and
+`muse_98`'s MUSE2 installs its API there. §2's `preset_muse_irq_jumper` already
+writes SSG reg 0x0E to steer exactly this choice — it presets `0xC0` (INT 14h)
+for MUSDRV. The jumper, not the family, is the unit of work again.
+
+`usd_98` is not an emulation problem at all: a file the gamelist references is
+not on disk. Worth checking against the unpack traps in the archive notes
+(flattened subdirectories, Shift_JIS names) before assuming the archive is
+simply short.
+
+**Decode the console first, next time.** It cost an afternoon of disassembly to
+learn things the driver had already printed.
+
+---
+
+## 15. Three things the console named, and the IVT convention behind two of them
+
+### 15.1 — `cplay98`: the board's IRQ jumper
+
+FPLAY Ver.0 printed 「常駐に失敗しました。割込み設定をＩＮＴ５に変更してください。」 —
+*failed to stay resident; change the interrupt setting to INT 5* — and exited.
+`HOOTRIP_IO_DEBUG=1` shows it reading **SSG reg 0x0E exactly once**: the
+PC-9801-26K's IRQ jumper, the same register `preset_muse_irq_jumper` already
+writes for MUSDRV. The board's jumper positions are INT0/INT41/INT5/INT6 →
+IRQ3/10/12/13 → INT 0Bh/12h/14h/15h, and `0xC0` selects INT5 — which is what
+MUSDRV wanted too, from the other end. Extending the preset to the `fplay`
+shells makes FPLAY print 「ＩＮＴ５に常駐しました。」 and play.
+
+**10 sets / 139 titles.** The 34 `fplay` sets that already worked were re-swept
+with and without the preset: **1,831 audible titles either way**, same status on
+every set. The jumper does not disturb a driver that was already happy with
+INT0.
+
+Note this did *not* split on the FPLAY build the way `fgplay_h` split on OPNDRV:
+six distinct FPLAY.COM binaries are always silent and ten others never are, but
+all sixteen are the same 16,138 bytes and half their bytes differ. The jumper
+is what separates them, not a version number.
+
+### 15.2 — `magic_98`: one word, two handles
+
+MAGIC_98's INT 7Fh handler reads port 0x7E2 as a **word**:
+
+```asm
+in  ax,dx          ; 0x7E2
+or  ah,ah
+jz  skip_timbre    ; high byte 0 -> no timbre at all
+mov bl,ah          ; AH = the DOS handle of the timbre file
+... lseek, read, driver call 3 "load timbre" ...
+skip_timbre:
+mov bl,al          ; AL = the song handle
+```
+
+The harness was presenting the low byte alone, so `AH` was zero, the timbre
+branch was skipped, and the driver stayed resident printing
+「音色が指定されていません」 — *no timbre specified*. Title codes here are
+`0x06SS`: byte 1 is the timbre rom's offset, the low byte the song's. Scoped to
+the `magic_98` stub deliberately — "a file rom sits at offset byte 1" is true of
+**83 sets across seven families**, most of which already play.
+
+### 15.3 — The free-vector convention
+
+Fixing the word was not enough: MAGIC_98 still called `INT EFh`, which nothing
+serves, while its driver sat on `INT 6Dh`. Its 282-byte stub says why:
+
+```asm
+mov ax,0x35ef      ; get the INT EFh vector
+int 21h
+cmp bx,0xfff0      ; BIOS dummy?  -> nobody owns EFh
+jnz use_ef         ; someone does -> call EFh
+mov ax,0x356d      ; else try INT 6Dh
+...
+```
+
+A PC-98 leaves **unclaimed vectors pointing at the BIOS dummy `IRET` in segment
+0xFFF0**, and drivers read that back to find a vector nobody owns.
+`install_trampolines` pointed all 256 vectors at our own `TRAMP_SEG`, so every
+such probe was told "yes, taken" and the caller then talked to a vector nobody
+serves.
+
+Pointing *every* unserviced vector at 0xFFF0 broke 29 sets. MUSIC.COM
+(`music_98`) reads INT 48h and treats **segment 0x60** — which `TRAMP_SEG`
+happens to be — as its "no resident copy" marker; with 48h moved to the BIOS
+dummy it matched INT 0Ah's segment and MUSIC.COM concluded a copy of itself was
+already resident, printed so, and exited. Both drivers are right about their own
+half of the machine: **PC-98 reserves INT 00h–5Fh for BIOS and DOS, and leaves
+60h–FFh as the free application range** — which is exactly where drivers install
+their APIs (PMD on 60h, MDRV and EMD on D2h, MAGIC on 6Dh/EFh). So only
+unserviced vectors at 0x60 and above read as the BIOS dummy. The dummy handlers
+sit at the bottom of segment 0xFFF0 so the top of the ROM — the reset vector and
+machine ID at 0xFFFF0 — is left alone.
+
+**12 sets / 175 titles**, and a convention that will matter to every future
+driver that asks whether a vector is free.
+
+### 15.4 — Result
+
+**22 sets / 314 titles**, 42 of 42 sampled tracks at −3.2 to −18.5 dBFS, and no
+regression or title-count change anywhere in the 337-set sweep.
+The 70-set control re-ripped **688 of 688 tracks byte-identical** — unlike the
+unopened-handle change, none of these three moves a set that was already
+playing. That is what you would expect: two are scoped to one stub each, and the
+third only changes what a guest reads back from vectors nothing was serving.
+
+Across the day: **66 sets / 1,303 titles**, leaving **160 sets / 3,091 titles**.
+
+### 15.5 — The queue, and where to start next
+
+157 sets / 3,032 titles (excluding the `(SC-88)` MIDI variants, which the
+exclusion lists used earlier in this document did *not* filter — they match
+`(SC-55` but not `(SC-88`, and that inflated `valky_98` by three sets).
+
+| stub | sets | titles | what the guest says |
+|---|---:|---:|---|
+| `usmd` | 7 | 208 | resident and healthy; 4 unserviced `INT 7Eh AH=0` |
+| `usd_98` | 12 | 208 | `sound vector 0x15`, one timer IRQ, both OPN timer flags stuck set |
+| `odq_98` | 5 | 192 | 「サウンドボードがありません！」 — board detection fails |
+| `synup_98` | 6 | 112 | 「内蔵音源ボード(FM6,0188H)」 then `Abnormal program termination` |
+| `ss_98` | 5 | 107 | resident, 15 writes, 3 key-ons, 0 s span |
+| `muse_98` | 6 | 106 | MUSE2 installs cleanly; its API is on **INT 05h** |
+| `muspj_98` | 7 | 90 | 162 timer IRQs, 354 writes, 14 captured |
+| `fmxp` | 5 | 83 | `FMX` / `FMXP` run to budget |
+| `magpa_98` | 4 | 77 | 「MPU-PC98 インターフェイスチェック中」 — stalls probing MIDI |
+| ~30 more | 100 | 1,849 | |
+
+Only **two** silent sets still have a working twin in the same archive folder
+(`nlp_hoot`, 63 titles) — that hint, which caught the 86 board and signature D,
+is nearly exhausted. The console messages are the live lead now.
+
+`odq_98` is the one to start on: 192 titles behind a driver that says in plain
+words it cannot find the sound board, and board detection is a re-host concern
+with a history of reaching sets nobody was aiming at.

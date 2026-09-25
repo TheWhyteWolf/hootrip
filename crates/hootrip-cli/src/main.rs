@@ -379,6 +379,7 @@ fn pc98_diag(
         deadline_secs: None,
         opn_clock_hz: None,
         fm_variant: is_fm_variant(g),
+        dummy_sndrom: has_dummy_sndrom(g),
     };
 
     println!("{}", g.name);
@@ -611,6 +612,7 @@ fn pc98_rip(
         deadline_secs: None,
         opn_clock_hz,
         fm_variant: is_fm_variant(g),
+        dummy_sndrom: has_dummy_sndrom(g),
     };
     let volmod = vgm_volume_modifier(headroom_db);
     let system = g
@@ -668,8 +670,13 @@ fn pc98_rip(
 
         let n_writes = outcome.log.writes.len();
         let base = format!("{:02} {}", i, sanitize(&track_name));
-        let status = if n_writes == 0 {
-            "NO WRITES"
+        // Same gate as archive-rip and the pc88 `rip`: a capture that cannot
+        // make a sound is not written. Writing anything with a register in it
+        // was the old test, and it ships silent files — a timbre-definition
+        // pseudo-track programs 60-odd registers and keys on nothing.
+        let class = hoot_log::audibility(&outcome.log);
+        let status = if class.is_silent() {
+            class.tag()
         } else {
             if format == "s98" || format == "both" {
                 let mut tags = S98Tags::default();
@@ -767,6 +774,7 @@ fn pc98_sweep(
             deadline_secs: Some(4.0),
             opn_clock_hz: None,
             fm_variant: is_fm_variant(g),
+            dummy_sndrom: has_dummy_sndrom(g),
         };
         if std::env::var_os("HOOTRIP_SWEEP_TRACE").is_some() {
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
@@ -925,6 +933,13 @@ fn clockmul_of(g: &hoot_xml::Game) -> u32 {
 /// a set in FM-variant mode captures that FM music instead of silent MIDI churn.
 fn is_fm_variant(g: &hoot_xml::Game) -> bool {
     g.options.iter().any(|o| o.name == "midiout")
+}
+
+/// hoot's `dummysndrom` option: this set's driver talks to the sound board
+/// through its BIOS ROM, so the harness must present one (see
+/// `Pc98RipOptions::dummy_sndrom`).
+fn has_dummy_sndrom(g: &hoot_xml::Game) -> bool {
+    g.options.iter().any(|o| o.name == "dummysndrom" && o.value != "0")
 }
 
 /// The game name to tag an FM-variant rip with: strip the MIDI-device and
@@ -1277,7 +1292,14 @@ fn write_track(
 }
 
 fn finalize_status(sum: &mut SetSummary, any_timeout: bool) {
-    if !sum.err.is_empty() {
+    // `err` carries the first failure message either way, but a failure that
+    // took down one title is not a failure of the set: those are counted in
+    // `error_titles` and the tallies below decide between "error" and
+    // "partial". Only a set-level failure (nothing was even attempted) short-
+    // circuits here — otherwise a set that lost one missing-rom title out of
+    // forty would be filed as "error" and re-ripped in full by every later
+    // --retry-failed pass.
+    if !sum.err.is_empty() && sum.error_titles == 0 {
         sum.status = "error".into();
         return;
     }
@@ -1405,6 +1427,7 @@ fn rip_one_set(
                 deadline_secs: deadline,
                 opn_clock_hz: None,
                 fm_variant: is_fm_variant(g),
+                dummy_sndrom: has_dummy_sndrom(g),
             };
             let system = g
                 .driver_alias
@@ -2273,10 +2296,13 @@ fn triage(
         }
     }
     // A set whose every track was silent leaves an empty folder behind.
-    // remove_dir refuses to touch a non-empty directory, so this can only
-    // ever clear the ones the move emptied.
+    // remove_dir refuses to touch a non-empty directory, so this can only ever
+    // clear the ones the move emptied — but skip `dir` itself. Tracks sitting
+    // directly in the directory the user named (a single set folder, or a flat
+    // pool of exports) key on that directory, and this command promises never
+    // to delete anything of theirs.
     let mut pruned = 0usize;
-    for set in sets.keys() {
+    for set in sets.keys().filter(|s| s.as_path() != dir) {
         if std::fs::remove_dir(set).is_ok() {
             pruned += 1;
         }

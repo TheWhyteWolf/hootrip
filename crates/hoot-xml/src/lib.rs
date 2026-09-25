@@ -10,4 +10,4 @@ pub use model::{
     format_code, parse_num, parse_unum, Bind, Driver, DriverAlias, Game, GameList, GameOption,
     Rom, RomList, Title, TitleEntry, TitleRange,
 };
-pub use parse::{decode_bytes, decode_file, parse_gamelist_file, parse_gamelist_str};
+pub use parse::{decode_bytes, decode_file, decode_shift_jis, parse_gamelist_file, parse_gamelist_str};

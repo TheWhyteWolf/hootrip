@@ -31,13 +31,27 @@ use hoot_cpu::{flag, np2::Np2Cpu, Reg16, Stop, X86Cpu};
 use hoot_log::{Chip, Device, RegWrite, RegisterLog};
 use hoot_xml::{parse_num, Game, RomList};
 
-use super::dos::{ExecResult, MiniDos, ProgKind, ARENA_END, CALL_RET_OFF, TRAMP_SEG};
+use super::dos::{
+    BiosTimerReq, ExecResult, MiniDos, ProgKind, ARENA_END, BIOS_DUMMY_SEG, CALL_RET_OFF,
+    TRAMP_SEG,
+};
 use super::io::Pc98Io;
 
 /// Nominal PC-98 CPU clock (80286/V30 class, ~8 MHz). The OPN is paced in its
 /// own chip-clock domain, so timing fidelity does not depend on this exactly;
 /// it is the log timestamp base and the run-budget unit.
 pub const PC98_CPU_HZ: u32 = 8_000_000;
+/// Where the PC-98 sound BIOS records the software interrupt it serves, inside
+/// the board's BIOS ROM. Drivers read this byte to find the sound BIOS and to
+/// confirm a board is fitted at all. See `Pc98RipOptions::dummy_sndrom`.
+const PC98_SNDROM_INT_OFF: usize = 0xCEE04;
+/// The interrupt the PC-98 sound BIOS serves.
+const PC98_SNDROM_INT: u8 = 0xD2;
+
+/// One PC-98 timer-BIOS tick in CPU cycles. The BIOS timer runs at 100 Hz, so a
+/// tick is 10 ms; see `MiniDos::int1c` for what the guest does with it and why
+/// only the order of magnitude matters.
+const PC98_BIOS_TICK_CPU: u64 = PC98_CPU_HZ as u64 / 100;
 /// PC-9801-26(K) OPN (YM2203) clock.
 pub const PC98_OPN_CLOCK_HZ: u32 = 3_993_600;
 /// PC-9801-86 OPNA (YM2608) clock.
@@ -114,6 +128,19 @@ pub struct Pc98RipOptions {
     /// the original FM soundtrack ships alongside as `.MFM` and is the only FM
     /// copy of this music in the archive. No-op for sets without a `.MFM` sibling.
     pub fm_variant: bool,
+    /// hoot `dummysndrom`: present the PC-98 sound BIOS as installed.
+    ///
+    /// A real PC-9801-26K/86 board carries a BIOS ROM, and software that drives
+    /// the board through it first asks the ROM which software interrupt it lives
+    /// on. hoot maps a stand-in for sets that ask; without one, FUGA System's
+    /// OPNDRV 1.23 reads zero, decides the machine has no sound board and keeps
+    /// only an 80-byte stub resident, so every note is lost.
+    ///
+    /// We model the single field we have direct evidence a driver reads — the
+    /// interrupt number, [`PC98_SNDROM_INT_OFF`] — rather than inventing ROM
+    /// contents. A set that probes something else will show up as still silent,
+    /// which is the honest outcome.
+    pub dummy_sndrom: bool,
 }
 
 impl Default for Pc98RipOptions {
@@ -127,6 +154,7 @@ impl Default for Pc98RipOptions {
             deadline_secs: None,
             opn_clock_hz: None,
             fm_variant: false,
+            dummy_sndrom: false,
         }
     }
 }
@@ -248,6 +276,9 @@ struct Engine<'a> {
     dbg_if_clear: u64,
     dbg_no_vec: u64,
     dbg_masked: u64,
+    /// The PC-98 timer-BIOS one-shot in flight: routine segment, offset, and the
+    /// cycle at which it comes due (see `MiniDos::int1c`).
+    bios_timer: Option<(u16, u16, u64)>,
     /// PIC in-service latch for the OPN interrupt: set when we deliver it, cleared
     /// when the driver's ISR writes an EOI. While set, a further OPN IRQ is held
     /// off even if a new edge is pending and IF is enabled — this is the 8259's
@@ -293,7 +324,7 @@ impl Engine<'_> {
     /// True if `vec` is hooked (points somewhere other than the trampoline).
     fn hooked(&self, vec: u8) -> bool {
         let (seg, _) = self.ivt(vec);
-        seg != TRAMP_SEG && seg != 0
+        seg != TRAMP_SEG && seg != BIOS_DUMMY_SEG && seg != 0
     }
 
     /// The vector the OPN timer IRQ is delivered on: the forced one, else the
@@ -346,11 +377,30 @@ impl Engine<'_> {
         if self.io.take_eoi() {
             self.opn_in_service = false;
         }
+        // PC-98 timer BIOS (INT 1Ch). The guest posts arm/cancel as a DOS-level
+        // call, so pick the request up here and turn an arm into a cycle
+        // deadline — before the IF gate, since neither depends on interrupt
+        // state.
+        match self.dos.bios_timer.take() {
+            Some(BiosTimerReq::Arm { seg, off, ticks }) => {
+                let due = self.cycle + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU;
+                self.bios_timer = Some((seg, off, due));
+            }
+            Some(BiosTimerReq::Cancel) => self.bios_timer = None,
+            None => {}
+        }
         if !self.irqs_enabled() {
             if self.io.opn.peek_irq_edge() {
                 self.dbg_if_clear += 1;
             }
             return false;
+        }
+        if let Some((seg, off, due)) = self.bios_timer {
+            if self.cycle >= due {
+                self.bios_timer = None;
+                enter_far(&mut *self.cpu, seg, off);
+                return true;
+            }
         }
         // PIT / IRQ0 → INT 08h.
         if self.io.pit.irq_pending && self.io.irq0_unmasked() && self.hooked(PC98_TIMER_VEC) {
@@ -530,11 +580,17 @@ impl Engine<'_> {
 }
 
 /// Load a program image and run it to its ending condition (or the budget).
-fn run_command(eng: &mut Engine, dos_image: (Vec<u8>, ProgKind), tail: &[u8], budget: u64) -> StepResult {
+fn run_command(
+    eng: &mut Engine,
+    name: &str,
+    dos_image: (Vec<u8>, ProgKind),
+    tail: &[u8],
+    budget: u64,
+) -> StepResult {
     let (image, kind) = dos_image;
     let load = match kind {
-        ProgKind::Com => eng.dos.load_com(eng.cpu, &image, tail),
-        ProgKind::Exe => eng.dos.load_exe(eng.cpu, &image, tail),
+        ProgKind::Com => eng.dos.load_com(eng.cpu, name, &image, tail),
+        ProgKind::Exe => eng.dos.load_exe(eng.cpu, name, &image, tail),
     };
     if let Err(e) = load {
         return StepResult::Error(e.to_string());
@@ -763,6 +819,7 @@ pub fn rip_title(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
 
     let mut notes = materialize(&mut dos, romlist, set_dir);
@@ -806,6 +863,7 @@ pub fn rip_title(
         dbg_no_vec: 0,
         dbg_masked: 0,
         opn_in_service: false,
+        bios_timer: None,
         deadline: opts
             .deadline_secs
             .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s)),
@@ -855,7 +913,7 @@ pub fn rip_title(
         let (name, tail) = split_cmd(&cmd);
         let before = eng.cycle;
         let result = match eng.dos.resolve_program(name) {
-            Some(img) => run_command(&mut eng, img, tail.as_bytes(), setup_budget),
+            Some(img) => run_command(&mut eng, name, img, tail.as_bytes(), setup_budget),
             None => StepResult::Error(format!("program {name:?} not found in set")),
         };
         shell.push(ShellStep { cmd, result, cycles: eng.cycle - before });
@@ -925,7 +983,7 @@ pub fn rip_title(
     let mut hooked_vectors = BTreeMap::new();
     for v in 0u16..256 {
         let (seg, off) = eng.ivt(v as u8);
-        if seg != TRAMP_SEG && seg != 0 {
+        if seg != TRAMP_SEG && seg != BIOS_DUMMY_SEG && seg != 0 {
             hooked_vectors.insert(v as u8, (seg, off));
         }
     }
@@ -954,7 +1012,7 @@ pub fn rip_title(
     log.end_t = capture_budget;
 
     let mut console = notes;
-    console.push_str(&String::from_utf8_lossy(&dos.con_out));
+    console.push_str(&console_text(&dos.con_out));
 
     Ok(Pc98RipOutcome {
         log,
@@ -1048,6 +1106,31 @@ fn selected_song(romlist: &RomList, title_code: u64) -> Option<String> {
         .map(|r| r.name.rsplit(['\\', '/', ':']).next().unwrap_or(&r.name).to_string())
 }
 
+/// A PC-98 guest writes its console in **Shift_JIS**, and peppers it with ANSI
+/// colour escapes. Decoding it as UTF-8 replaces every Japanese message with
+/// question marks, which is how "there is no sound board" — the driver telling
+/// you exactly why it gave up — reaches a diagnostic as unreadable noise.
+fn console_text(bytes: &[u8]) -> String {
+    let text = hoot_xml::decode_shift_jis(bytes);
+    // Strip CSI sequences (ESC [ ... final byte): they colour the reader's own
+    // terminal and carry nothing about what the driver did.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Bind the selected song to the DOS handle(s) the driver reads and set the
 /// funcvect selection ports (0x7E0 cmd / 0x7E2 song / 0x7E4 param), honoring
 /// per-family delivery conventions. Shared by the rip and trace capture paths.
@@ -1082,7 +1165,13 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     // the content path. cplay98 additionally plays a 0-based in-bank index off
     // port 0x7E4 (title byte 2); MUSDRV/MDRV are one file per song.
     let cplay_family = shell_starts(&["cplay", "fplay"]);
-    let opens_by_name = cplay_family || shell_starts(&["musdrv", "mbmusp", "mdrv_9", "mddrv_9"]);
+    // EMD (`emd_98`) joins them: its stub reads handle 0 into a buffer, writes a
+    // NUL at the byte count it just got back, and passes that to INT D2h AH=1 —
+    // terminating a *string*, which is only meaningful for a filename. Handed
+    // content instead, AH=1 fails, the stub takes its `jnz` exit and returns
+    // without ever calling the play entry, leaving a timer ticking over silence.
+    let opens_by_name =
+        cplay_family || shell_starts(&["musdrv", "mbmusp", "mdrv_9", "mddrv_9", "emd_98"]);
     if let Some(sf) = song_file {
         if opens_by_name {
             eng.dos.set_handle_text(0, sf);
@@ -1113,6 +1202,11 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     // the pack content (bind_rom_handles), nothing goes on handle 0. Self-identify
     // by a `.PAC` file rom at offset == byte 1.
     let byte1 = ((title_code >> 8) & 0xFF) as u16;
+    // MAGIC_98 (`magic_98` stub + MUSIC_.EXE) reads a timbre file from the DOS
+    // handle in title byte 1 before playing the song in the low byte. Scoped to
+    // the stub: the "a file rom sits at offset byte1" shape alone is true of 83
+    // sets across six other families, most of which already play.
+    let magic_voice = byte1 != 0 && byte2 == 0 && shell_starts(&["magic_98"]);
     let packed = byte1 != 0
         && romlist.roms.iter().any(|r| {
             r.kind == "file"
@@ -1125,6 +1219,15 @@ fn bind_trigger_song(eng: &mut Engine, romlist: &RomList, song_file: &Option<Str
     } else if mdr_voice {
         eng.io.ext_song = 0;
         eng.io.ext_param = byte2; // byte 2 → 0x7E4 = voice-file DOS handle
+    } else if magic_voice {
+        // MAGIC_98: one word carries both handles — its INT 7Fh handler reads
+        // 0x7E2 as AX, and `or ah,ah / jz` skips the timbre load entirely when
+        // the high byte is zero. AH is then lseek'd and read as the timbre file
+        // (driver call 3, "load timbre") before AL is played as the song. Left
+        // with the low byte alone the driver stays resident and prints
+        // 「音色が指定されていません」 — no timbre specified — and never sounds.
+        eng.io.ext_song = (title_code & 0xFFFF) as u16; // 0x7E2: high=timbre handle, low=song
+        eng.io.ext_param = 0;
     } else if packed {
         eng.io.ext_song = (title_code & 0xFFFF) as u16; // 0x7E2: high=pack handle, low=index
         eng.io.ext_param = 0;
@@ -1160,7 +1263,11 @@ fn preset_muse_irq_jumper(eng: &mut Engine, romlist: &RomList) {
             n.starts_with("musdrv") || n.starts_with("mbmusp")
         }
     });
-    if mbmusp {
+    let fplay = romlist
+        .roms
+        .iter()
+        .any(|r| r.kind == "shell" && r.name.to_ascii_lowercase().starts_with("fplay"));
+    if mbmusp || fplay {
         eng.io.opn.set_ssg_readback(0x0E, 0xC0);
     }
 }
@@ -1215,6 +1322,7 @@ pub fn trace_title(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
     let _ = materialize(&mut dos, romlist, set_dir);
     // Bind rom→handle as the capture path does, so `--trace` reflects the real
@@ -1238,8 +1346,8 @@ pub fn trace_title(
         .resolve_program(name)
         .with_context(|| format!("program {name:?} not found"))?;
     match prog {
-        ProgKind::Com => dos.load_com(&mut cpu, &image, tail.as_bytes())?,
-        ProgKind::Exe => dos.load_exe(&mut cpu, &image, tail.as_bytes())?,
+        ProgKind::Com => dos.load_com(&mut cpu, name, &image, tail.as_bytes())?,
+        ProgKind::Exe => dos.load_exe(&mut cpu, name, &image, tail.as_bytes())?,
     };
 
     let mut io = Pc98Io::new(opn_hz, is_opna);
@@ -1249,7 +1357,11 @@ pub fn trace_title(
     let mut int_seq = Vec::new();
     let mut int_counts: BTreeMap<u8, u64> = BTreeMap::new();
     let mut steps = 0u64;
+    let mut cycles = 0u64;
     let mut stalled = false;
+    // The PC-98 timer-BIOS one-shot, tracked exactly as the rip path tracks it
+    // so a `--trace` of a driver that calibrates against it sees the same run.
+    let mut bios_timer: Option<(u16, u16, u64)> = None;
 
     // Spin detection: sample the hottest PC every window. A window dominated by
     // one PC is only a *stall* if no timer IRQ fired in it — a busy-wait that is
@@ -1259,8 +1371,24 @@ pub fn trace_title(
     let mut win_irqs = 0u64;
 
     while steps < max_steps {
+        match dos.bios_timer.take() {
+            Some(BiosTimerReq::Arm { seg, off, ticks }) => {
+                bios_timer = Some((seg, off, cycles + (ticks.max(1) as u64) * PC98_BIOS_TICK_CPU));
+            }
+            Some(BiosTimerReq::Cancel) => bios_timer = None,
+            None => {}
+        }
         // Deliver a pending timer IRQ between instructions, as hardware would.
         if cpu.reg16(Reg16::Flags) & flag::IF != 0 {
+            if let Some((seg, off, due)) = bios_timer {
+                if cycles >= due {
+                    bios_timer = None;
+                    enter_far(&mut cpu, seg, off);
+                    win_irqs += 1;
+                    steps += 1;
+                    continue;
+                }
+            }
             if io.pit.irq_pending && io.irq0_unmasked() && trace_hooked(&cpu, PC98_TIMER_VEC) {
                 io.pit.ack();
                 cpu.interrupt(PC98_TIMER_VEC);
@@ -1305,6 +1433,7 @@ pub fn trace_title(
         }
         io.pit.tick(elapsed, cpu_hz);
         io.tick_vsync(elapsed, cpu_hz);
+        cycles += elapsed;
 
         if stop == Stop::Halted {
             let cs2 = cpu.reg16(Reg16::Cs);
@@ -1325,6 +1454,7 @@ pub fn trace_title(
                 // fire and wake it (rather than treating it as a stall).
                 io.pit.tick(IDLE_QUANTUM_CPU, cpu_hz);
                 io.tick_vsync(IDLE_QUANTUM_CPU, cpu_hz);
+                cycles += IDLE_QUANTUM_CPU;
             }
         }
 
@@ -1352,7 +1482,7 @@ pub fn trace_title(
         int_counts,
         fm_writes: io.total_writes,
         stalled,
-        console: String::from_utf8_lossy(&dos.con_out).into_owned(),
+        console: console_text(&dos.con_out),
         unknown_ports: io.unknown.clone(),
     })
 }
@@ -1408,6 +1538,7 @@ pub fn trace_capture(
     let mut dos = MiniDos::new();
     dos.init_arena(cpu.mem());
     dos.install_trampolines(cpu.mem());
+    set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
     let _ = materialize(&mut dos, romlist, set_dir);
     let mut song_file = selected_song(romlist, title_code);
@@ -1441,6 +1572,7 @@ pub fn trace_capture(
         dbg_no_vec: 0,
         dbg_masked: 0,
         opn_in_service: false,
+        bios_timer: None,
         deadline: None,
         timed_out: false,
     };
@@ -1478,7 +1610,7 @@ pub fn trace_capture(
         }
         let (name, tail) = split_cmd(&cmd);
         let result = match eng.dos.resolve_program(name) {
-            Some(img) => run_command(&mut eng, img, tail.as_bytes(), setup_budget),
+            Some(img) => run_command(&mut eng, name, img, tail.as_bytes(), setup_budget),
             None => StepResult::Error(format!("program {name:?} not found")),
         };
         shell.push((cmd, format!("{result:?}")));
@@ -1609,6 +1741,36 @@ pub fn trace_capture(
     Ok(CaptureTrace { steps, hot, frozen, wild_jumps, api_calls, reads, fm_writes, irqs, shell })
 }
 
+/// Install or remove the PC-98 sound BIOS's presence byte.
+///
+/// Always written, never merely set: the NP2 core's memory is a process global
+/// and the per-rip wipe covers only conventional RAM (`0..0xA_0000`), so a byte
+/// left in the BIOS ROM window by one set is still there for the next set in
+/// the same process. `pc98-sweep` runs hundreds of sets that way, and a driver
+/// that finds this byte behaves differently — so a set with `dummysndrom` would
+/// silently turn on the sound BIOS for every set swept after it.
+fn set_sound_bios(cpu: &mut dyn X86Cpu, present: bool) {
+    cpu.mem()[PC98_SNDROM_INT_OFF] = if present { PC98_SNDROM_INT } else { 0 };
+}
+
+/// Enter `seg:off` the way hardware enters an interrupt handler — flags, CS and
+/// IP pushed on the guest's own stack, IF cleared — so the routine's `IRET`
+/// returns to whatever it interrupted. `X86Cpu::interrupt` only dispatches
+/// through the IVT; a BIOS callback has no vector of its own.
+fn enter_far(cpu: &mut dyn X86Cpu, seg: u16, off: u16) {
+    let ss = cpu.reg16(Reg16::Ss);
+    let flags = cpu.reg16(Reg16::Flags);
+    let frame = [flags, cpu.reg16(Reg16::Cs), cpu.reg16(Reg16::Ip)];
+    let mut sp = cpu.reg16(Reg16::Sp);
+    for v in frame {
+        sp = sp.wrapping_sub(2);
+        wr16(cpu.mem(), lin(ss, sp), v);
+    }
+    cpu.set_ss_sp(ss, sp);
+    cpu.set_reg16(Reg16::Flags, flags & !flag::IF);
+    cpu.set_cs_ip(seg, off);
+}
+
 /// Whether IVT[`vec`] points somewhere other than the harness trampoline.
 fn trace_hooked(cpu: &dyn X86Cpu, vec: u8) -> bool {
     let m = cpu.mem_ref();
@@ -1671,4 +1833,25 @@ fn install_idle_stub(cpu: &mut dyn X86Cpu) {
     cpu.set_ss_sp(IDLE_SEG, 0xF000); // ~61 KB of stack headroom below the arena
     let f = cpu.reg16(Reg16::Flags) | flag::IF;
     cpu.set_reg16(Reg16::Flags, f);
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::console_text;
+
+    /// The guest writes Shift_JIS. `from_utf8_lossy` turned odq_98's
+    /// 「サウンドボードがありません！」 — "there is no sound board", the whole
+    /// diagnosis for 192 silent titles — into a row of replacement characters.
+    #[test]
+    fn shift_jis_console_survives_and_ansi_does_not() {
+        let sjis = b"\x1b[33m\x83T\x83E\x83\x93\x83h\x83{\x81[\x83h\x82\xaa\x82\xa0\x82\xe8\x82\xdc\x82\xb9\x82\xf1\x81I\x1b[37m";
+        assert_eq!(console_text(sjis), "サウンドボードがありません！");
+    }
+
+    /// A bare ESC, or a CSI nobody terminated, must not eat the rest of the log.
+    #[test]
+    fn a_stray_escape_does_not_swallow_the_message() {
+        assert_eq!(console_text(b"ok\x1bdone"), "ok\u{1b}done");
+        assert_eq!(console_text(b"ok\x1b[999"), "ok");
+    }
 }

@@ -53,6 +53,20 @@ pub const SOUND86_ID: u16 = 0xA460;
 /// return 0x40/0x50-class IDs; the driver masks the low 2 bits before use.
 pub const SOUND86_ID_VALUE: u8 = 0x40;
 
+/// PC-9801-86 PCM control/status register (0xA468). Bits 0-2 select the sample
+/// rate and bit 3 resets the FIFO; those are write-only controls we keep only
+/// so the driver's read-modify-write updates see their own bits back. **Bit 4
+/// reads back as "the PCM FIFO wants more data"** — PMD86's IRQ handler spins
+/// on it (`in al,dx / test al,0x10 / jnz`), refilling until the request drops.
+pub const PCM86_CTRL: u16 = 0xA468;
+/// Bit 4 of [`PCM86_CTRL`]: the FIFO is below its refill threshold. The 86
+/// board's PCM is a separate DAC that no S98/VGM device can carry, so we model
+/// a FIFO that never starves and always report it clear. The driver then skips
+/// its PCM feed and gets on with sequencing the FM chip — which is the part we
+/// can actually log. Reporting it set (what an unmodelled 0xFF read does) hangs
+/// every PMD86 set in that refill loop.
+pub const PCM86_FIFO_REQ: u8 = 0x10;
+
 /// hoot's "externalCommand" virtual ports, read by a `funcvect` glue stub
 /// (e.g. PMD_98.COM) inside its INT 7Eh handler: 0x7E0 = command byte,
 /// 0x7E2 = song word (low byte = song, high byte 0), 0x7E8 = handshake state
@@ -257,6 +271,9 @@ pub struct Pc98Io {
     /// reads 0xFF; OPN-only sets model a machine without the board, so the ID
     /// must read 0xFF there to keep them on their 26-board/built-in path.
     pub has_86_board: bool,
+    /// Last byte written to [`PCM86_CTRL`], handed back on read (minus the
+    /// status bit) so the driver's read-modify-write rate/FIFO updates stick.
+    pcm86_ctrl: u8,
     /// When set, log every OPN/detection port access to stderr (env-gated).
     pub io_debug: bool,
 }
@@ -285,6 +302,7 @@ impl Pc98Io {
             unknown: BTreeMap::new(),
             has_86_board,
             port60: 0,
+            pcm86_ctrl: 0,
             vsync_residual: 0,
             vsync_pending: false,
             io_debug: std::env::var_os("HOOTRIP_IO_DEBUG").is_some(),
@@ -431,6 +449,7 @@ impl IoBus for Pc98Io {
             // Other 86-board PCM/volume config the OPNA driver pokes (0xA46x
             // PCM ctrl/level, 0xA66x FM/PCM mixer, 0x6E PCM volume latch). We
             // log the music via the OPN registers, so these are accepted/dropped.
+            PCM86_CTRL => self.pcm86_ctrl = val,
             0xA461..=0xA46F | 0xA660..=0xA66F | 0x6E => {}
             // MPU-401 MIDI UART (0xE0D0 data / 0xE0D2 command). Some FMP3 builds
             // reset the MIDI device during init even in FM mode; the melody goes
@@ -497,6 +516,13 @@ impl IoBus for Pc98Io {
                 self.port60 ^= 0x20;
                 self.port60
             }
+            // 86-board PCM status (0xA468): the driver's own control bits back,
+            // with the FIFO request always clear (see [`PCM86_FIFO_REQ`]).
+            PCM86_CTRL => self.pcm86_ctrl & !PCM86_FIFO_REQ,
+            // The rest of the 86-board PCM block (FIFO data, byte count, volume).
+            // Read as 0 rather than falling through to 0xFF: a driver polling any
+            // of these for a flag should see "nothing pending", not "all bits set".
+            0xA461..=0xA46F => 0,
             // 86-board ID: non-0xFF ⇒ present (only when the set models one).
             SOUND86_ID => {
                 if self.has_86_board {
@@ -516,5 +542,35 @@ impl IoBus for Pc98Io {
             eprintln!("[io] in  {port:#06x} (addr0={:#04x}) -> {v:#04x}", self.opn.addr0());
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMD86's IRQ handler polls the 86-board FIFO request bit and refills until
+    /// it drops (`in al,0xa468 / test al,0x10 / jnz`). An unmodelled read hands
+    /// back 0xFF, so the bit is never clear and the driver never leaves the
+    /// refill loop — that hung all 30 PC-9801-86 sets. The status bit must read
+    /// clear no matter what the driver last wrote there.
+    #[test]
+    fn pcm86_fifo_never_asks_for_more_data() {
+        let mut io = Pc98Io::new(3_993_600, true);
+        assert_eq!(io.in8(PCM86_CTRL) & PCM86_FIFO_REQ, 0);
+        // Even after the driver's own read-modify-write sets the bit.
+        io.out8(PCM86_CTRL, 0xFF);
+        assert_eq!(io.in8(PCM86_CTRL) & PCM86_FIFO_REQ, 0);
+    }
+
+    /// The rate/FIFO-reset bits are read-modify-written (`in / and / or / out`),
+    /// so they have to survive the round trip or the driver's second update
+    /// works from someone else's value.
+    #[test]
+    fn pcm86_control_bits_read_back() {
+        let mut io = Pc98Io::new(3_993_600, true);
+        io.out8(PCM86_CTRL, 0x05);
+        assert_eq!(io.in8(PCM86_CTRL), 0x05);
+        assert!(!io.unknown.contains_key(&PCM86_CTRL), "0xA468 must not count as unmodelled");
     }
 }

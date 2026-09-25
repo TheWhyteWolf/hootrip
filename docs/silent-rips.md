@@ -46,9 +46,27 @@ in the wild and both render to pure zero:
 - **SSG envelope mode.** Bit 4 of a level register hands amplitude to the
   envelope generator and makes the level bits meaningless. A channel parked at
   `0x10` with no envelope shape (reg 0x0D) ever written produces nothing.
+  **The mode bit wins**: `0x18` is as silent as `0x10`, because the hardware
+  discards the fixed nibble whenever bit 4 is set. Reading the nibble first —
+  which this module did until 2026-09-16 — passes such a channel, and shipped
+  32 digitally-silent files (see below).
 
 Both also re-evaluate retroactively: unmuting a channel, or starting the
 envelope, can give voice to a level that was latched earlier.
+
+### Where the gate is applied
+
+Every path that writes a track classifies it first: `archive-rip` (both the pc88
+and pc98dos loops), `rip`, `pc98-rip`, and the two sweeps. `pc98-rip` was the
+exception until 2026-09-16 — it still used the original "did it write anything"
+test, so a single-set rip shipped files the batch rip would have dropped. The
+tell is a track with a few dozen writes and no notes: the NL family's
+`音色定義` timbre-definition pseudo-tracks program ~60 registers, key on
+nothing, and rendered to digital zero.
+
+If you are validating a fix by ripping one set, use a build after that date, or
+run `hootrip triage` over the output — otherwise a designed-silent pseudo-track
+reads as a failure of the fix.
 
 ### Validation
 
@@ -61,6 +79,13 @@ Verdicts were checked against audio rendered by libvgm (`vgm2wav --loops 1
 | `NoVoice` | 20 / 20 |
 | `AdpcmOnly` | 19 / 20 (see §4) |
 | `Audible` | 0 / 60 |
+
+The envelope-mode correction was measured the same way rather than assumed: it
+reclassifies **32 of the library's 48,242 tracks** from `audible` to `dead`, and
+**32/32 render to digital zero**. No track moved the other way. 28 are Melroon's
+`効果音` sound-effect slots; the other four are named Tetris songs (`HEROES`,
+`PEDDLER`, `CELEBRATION 1`/`2`) — real rip failures the old rule was hiding.
+The promoted library is therefore 99.93% audible, not 100%.
 
 ## 3. The measured split
 
