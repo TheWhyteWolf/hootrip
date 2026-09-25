@@ -91,7 +91,8 @@ pub struct Pc98RipOptions {
     pub funcvect: Option<u8>,
     /// Force the timer/sound IRQ vector instead of auto-detecting it.
     pub sound_vector: Option<u8>,
-    /// Wall-clock cap (seconds) for the whole rip. A set whose driver spins
+    /// Wall-clock cap (seconds) for one `rip_title` call — it is re-armed per
+    /// song, not shared across a set. A set whose driver spins
     /// (never idles to HLT) executes its full emulated budget instruction by
     /// instruction, which is slow; this bounds it so a broad sweep can't stall
     /// on a non-working set. `None` = no wall-clock cap (normal rips).

@@ -159,6 +159,11 @@ impl Machine for Pc88Bus {
 pub struct RipOptions {
     /// Emulated seconds to run after triggering the song.
     pub seconds: f64,
+    /// Wall-clock cap (seconds) for this one title. A driver that never reaches
+    /// its poll loop executes the whole emulated budget instruction by
+    /// instruction, which is slow; this bounds it so a broad sweep can't stall
+    /// on a non-working set. `None` = no wall-clock cap (normal rips).
+    pub deadline_secs: Option<f64>,
     /// Emulated seconds allowed for the bootstrap to reach its poll loop.
     pub boot_seconds: f64,
     /// CPU clock multiplier (hoot `clockmul`; PC-88 default 1).
@@ -167,7 +172,7 @@ pub struct RipOptions {
 
 impl Default for RipOptions {
     fn default() -> Self {
-        RipOptions { seconds: 120.0, boot_seconds: 0.5, clockmul: 1 }
+        RipOptions { seconds: 120.0, deadline_secs: None, boot_seconds: 0.5, clockmul: 1 }
     }
 }
 
@@ -179,6 +184,9 @@ pub struct RipOutcome {
     pub irqs: (u64, u64),
     /// IM 2 vector-table entries for levels 0-7 at end of run (diagnostics).
     pub vectors: [u16; 8],
+    /// True if the run hit `RipOptions::deadline_secs` (a spinning driver).
+    /// The log is a partial capture when this is set.
+    pub timed_out: bool,
 }
 
 /// Rip one title from a pc88 game: load, boot, trigger, run, log.
@@ -191,6 +199,9 @@ pub fn rip_title(
     let romlist = game.romlist.as_ref().context("game has no romlist")?;
     // clockmul scales the CPU only; the OPN keeps its real chip clock.
     let cpu_hz = (PC88_CPU_HZ as u64) * opts.clockmul.max(1) as u64;
+    let deadline = opts
+        .deadline_secs
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
 
     let mut bus = Pc88Bus::new(PC88_OPN_CLOCK_HZ, cpu_hz);
     // OPNA sets carry a YM2608 Sound Board II; mark the chip so register-0xFF
@@ -299,6 +310,8 @@ pub fn rip_title(
         next_vrtc: cpu_hz * 1000 / VRTC_MILLIHZ,
         opn_residual: 0,
         irqs: (0, 0),
+        deadline,
+        timed_out: false,
     };
     runner.run_until(boot_cycles);
 
@@ -313,6 +326,10 @@ pub fn rip_title(
     let end = t0 + (opts.seconds * cpu_hz as f64) as u64;
     runner.run_until(end);
     let irqs = runner.irqs;
+    // A deadline abort leaves the CPU short of `end`; log only what was reached
+    // so the capture's end_t matches the writes it actually contains.
+    let timed_out = runner.timed_out;
+    let end = if timed_out { runner.cpu.cycle_count().max(t0) } else { end };
 
     // --- Collect the log ----------------------------------------------------
     // Declare YM2608 when the driver touched the extended bank; at these
@@ -336,7 +353,7 @@ pub fn rip_title(
         *v = bus.peek16(table);
     }
 
-    Ok(RipOutcome { log, unknown_ports: bus.unknown_ports.clone(), irqs, vectors })
+    Ok(RipOutcome { log, unknown_ports: bus.unknown_ports.clone(), irqs, vectors, timed_out })
 }
 
 struct Runner<'a> {
@@ -353,7 +370,16 @@ struct Runner<'a> {
     /// Fractional CPU-cycle accumulator for OPN-clock conversion (units of cpu_hz).
     opn_residual: u64,
     irqs: (u64, u64),
+    /// Wall-clock cutoff for the whole title, or `None` for no cap.
+    deadline: Option<std::time::Instant>,
+    /// True if a `run_until` returned early because it hit `deadline`.
+    timed_out: bool,
 }
+
+/// Instructions between wall-clock checks in [`Runner::run_until`].
+/// `Instant::now()` is a syscall-ish cost, so poll it rarely; at ~4 MHz this is
+/// still a sub-millisecond granularity on the guard.
+const WALL_POLL_INSNS: u32 = 65_536;
 
 impl Runner<'_> {
     /// IM 2 vector-table entry for a data-bus byte, at the CPU's current I.
@@ -363,7 +389,21 @@ impl Runner<'_> {
     }
 
     fn run_until(&mut self, end_cycle: u64) {
+        let mut poll = 0u32;
         while self.cpu.cycle_count() < end_cycle {
+            // Spin-guard: bail out of a driver that will never finish its
+            // emulated budget in reasonable wall time. Checked every
+            // WALL_POLL_INSNS instructions so the normal path pays ~nothing.
+            if let Some(dl) = self.deadline {
+                poll += 1;
+                if poll >= WALL_POLL_INSNS {
+                    poll = 0;
+                    if std::time::Instant::now() >= dl {
+                        self.timed_out = true;
+                        return;
+                    }
+                }
+            }
             let now = self.cpu.cycle_count();
             self.bus.now = now;
 
