@@ -862,7 +862,11 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
             }
             Ok(_) => {
                 no_writes += 1;
-                failures.push(format!("[no writes] {} ({kind})", g.name));
+                // Not necessarily write-free: the gate is audibility, so this
+                // also catches a set that drives the chip but never keys a
+                // note. Saying "no writes" here sent an earlier analysis
+                // hunting for a dead bus on sets that had a busy one.
+                failures.push(format!("[silent] {} ({kind})", g.name));
             }
             Err(e) => {
                 errors += 1;
