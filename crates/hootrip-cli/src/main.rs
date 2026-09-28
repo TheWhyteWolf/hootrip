@@ -799,32 +799,21 @@ fn pc98_sweep(
         if std::env::var_os("HOOTRIP_SWEEP_TRACE").is_some() {
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
         }
-        // Title 0 is not a verdict (see [`sweep_verdict`]); keep going until a
-        // title is audible. A timeout ends the search — the set is spinning,
-        // and the next title would only spend the same budget again.
-        let mut outcome = None;
-        let mut tried = 0usize;
-        for t in titles.iter().take(max_titles) {
-            tried += 1;
-            match hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts) {
-                Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
-                    outcome = Some(("ok", o.log.writes.iter().any(|w| w.port == 1), String::new()));
-                    break;
+        // Title 0 is not a verdict — see [`sweep_verdict`], which carries the
+        // OPNA-extended flag out of whichever title turned out to be audible.
+        let (verdict, tried) = sweep_verdict(titles.iter().take(max_titles), |t| {
+            hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts).map(|o| {
+                if !hoot_log::audibility(&o.log).is_silent() {
+                    SweepStep::Audible(o.log.writes.iter().any(|w| w.port == 1))
+                } else if o.timed_out {
+                    SweepStep::TimedOut
+                } else {
+                    SweepStep::Silent
                 }
-                Ok(o) if o.timed_out => {
-                    outcome = Some(("timeout", false, String::new()));
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    outcome = Some(("error", false, format!("{e}")));
-                    break;
-                }
-            }
-        }
-        let (status, ext, err) = outcome.unwrap_or(("silent", false, String::new()));
-        match status {
-            "ok" => {
+            })
+        });
+        let (status, ext) = match verdict {
+            SweepVerdict::Audible(ext) => {
                 ok += 1;
                 ke.0 += 1;
                 if ext {
@@ -833,20 +822,24 @@ fn pc98_sweep(
                 if tried > 1 {
                     late += 1;
                 }
+                ("ok", ext)
             }
-            "timeout" => {
+            SweepVerdict::TimedOut => {
                 timeouts += 1;
                 failures.push(format!("[timeout] {} ({kind}) [{archive}]", g.name));
+                ("timeout", false)
             }
-            "error" => {
+            SweepVerdict::Error(e) => {
                 errors += 1;
-                failures.push(format!("[error] {} ({kind}) [{archive}]: {err}", g.name));
+                failures.push(format!("[error] {} ({kind}) [{archive}]: {e}", g.name));
+                ("error", false)
             }
-            _ => {
+            SweepVerdict::Silent => {
                 silent += 1;
                 failures.push(format!("[silent] {} ({kind}) [{archive}] [{tried} titles tried]", g.name));
+                ("silent", false)
             }
-        }
+        };
         if oneline {
             println!("{status}\t{kind}\t{}\t{}", ext as u8, g.name);
         }
@@ -876,10 +869,20 @@ fn pc98_sweep(
     }
 }
 
-/// What a sweep decided about one set.
-enum SweepVerdict {
-    Audible,
+/// What one title's rip told the sweep.
+enum SweepStep<T> {
+    /// Audible, carrying whatever the caller wants to keep from that rip.
+    Audible(T),
     Silent,
+    /// The capture spun out its wall-clock budget (pc98 only).
+    TimedOut,
+}
+
+/// What a sweep decided about one set.
+enum SweepVerdict<T> {
+    Audible(T),
+    Silent,
+    TimedOut,
     Error(anyhow::Error),
 }
 
@@ -895,17 +898,19 @@ enum SweepVerdict {
 ///
 /// An error ends the search rather than moving on: the errors seen here are
 /// set-level (a loader refusing the set's `.COM`), so retrying per title would
-/// only multiply the same failure.
-fn sweep_verdict<T>(
-    titles: impl Iterator<Item = T>,
-    mut rip: impl FnMut(T) -> Result<bool>,
-) -> (SweepVerdict, usize) {
+/// only multiply the same failure. A timeout ends it too — the set is
+/// spinning, and the next title would only spend the same budget again.
+fn sweep_verdict<Title, T>(
+    titles: impl Iterator<Item = Title>,
+    mut rip: impl FnMut(Title) -> Result<SweepStep<T>>,
+) -> (SweepVerdict<T>, usize) {
     let mut tried = 0;
     for t in titles {
         tried += 1;
         match rip(t) {
-            Ok(true) => return (SweepVerdict::Audible, tried),
-            Ok(false) => {}
+            Ok(SweepStep::Audible(v)) => return (SweepVerdict::Audible(v), tried),
+            Ok(SweepStep::TimedOut) => return (SweepVerdict::TimedOut, tried),
+            Ok(SweepStep::Silent) => {}
             Err(e) => return (SweepVerdict::Error(e), tried),
         }
     }
@@ -950,11 +955,16 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, max_titles: usize,
 
         let opts = hoot_machine::RipOptions { seconds, clockmul: clockmul_of(g), ..Default::default() };
         let (verdict, tried) = sweep_verdict(titles.iter().take(max_titles), |t| {
-            hoot_machine::rip_title(g, &set_dirs, t.code, &opts)
-                .map(|o| !hoot_log::audibility(&o.log).is_silent())
+            hoot_machine::rip_title(g, &set_dirs, t.code, &opts).map(|o| {
+                if hoot_log::audibility(&o.log).is_silent() {
+                    SweepStep::Silent
+                } else {
+                    SweepStep::Audible(())
+                }
+            })
         });
         match verdict {
-            SweepVerdict::Audible => {
+            SweepVerdict::Audible(()) => {
                 ok += 1;
                 ke.0 += 1;
                 if tried > 1 {
@@ -973,6 +983,8 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, max_titles: usize,
                 errors += 1;
                 failures.push(format!("[error] {} ({kind}) [{archive}]: {e}", g.name));
             }
+            // pc88 rips carry no wall-clock deadline, so this cannot arise.
+            SweepVerdict::TimedOut => unreachable!("pc88 sweep sets no deadline"),
         }
     }
 
@@ -2418,23 +2430,28 @@ fn triage(
 
 #[cfg(test)]
 mod sweep_tests {
-    use super::{sweep_verdict, SweepVerdict};
+    use super::{sweep_verdict, SweepStep, SweepVerdict};
+    use anyhow::Result;
+
+    fn step(audible: bool) -> Result<SweepStep<&'static str>> {
+        Ok(if audible { SweepStep::Audible("ext") } else { SweepStep::Silent })
+    }
 
     /// The whole point: a set whose title 0 is silent is not a silent set.
     /// 43 pc88 sets cross this line.
     #[test]
     fn a_later_audible_title_saves_the_set() {
         let audible = [false, false, true, false];
-        let (v, tried) = sweep_verdict(audible.iter(), |a| Ok(*a));
-        assert!(matches!(v, SweepVerdict::Audible));
+        let (v, tried) = sweep_verdict(audible.iter(), |a| step(*a));
+        assert!(matches!(v, SweepVerdict::Audible("ext")), "the audible rip's payload comes back");
         assert_eq!(tried, 3, "the search stops at the first audible title");
     }
 
     /// A healthy set must not pay for the extra attempts.
     #[test]
     fn an_audible_title_0_costs_one_rip() {
-        let (v, tried) = sweep_verdict([true, true, true].iter(), |a| Ok(*a));
-        assert!(matches!(v, SweepVerdict::Audible));
+        let (v, tried) = sweep_verdict([true, true, true].iter(), |a| step(*a));
+        assert!(matches!(v, SweepVerdict::Audible(_)));
         assert_eq!(tried, 1);
     }
 
@@ -2443,9 +2460,21 @@ mod sweep_tests {
     /// from four.
     #[test]
     fn silent_reports_how_many_titles_were_tried() {
-        let (v, tried) = sweep_verdict([false, false].iter(), |a| Ok(*a));
+        let (v, tried) = sweep_verdict([false, false].iter(), |a| step(*a));
         assert!(matches!(v, SweepVerdict::Silent));
         assert_eq!(tried, 2);
+    }
+
+    /// A spinning set is not worth three more attempts at the same spin.
+    #[test]
+    fn a_timeout_ends_the_search() {
+        let mut calls = 0;
+        let (v, tried) = sweep_verdict([0, 1, 2].iter(), |_| {
+            calls += 1;
+            Ok(SweepStep::<()>::TimedOut)
+        });
+        assert!(matches!(v, SweepVerdict::TimedOut));
+        assert_eq!((tried, calls), (1, 1));
     }
 
     /// The errors seen here are set-level — a loader refusing the set's
@@ -2453,7 +2482,7 @@ mod sweep_tests {
     #[test]
     fn an_error_ends_the_search() {
         let mut calls = 0;
-        let (v, tried) = sweep_verdict([0, 1, 2].iter(), |_| {
+        let (v, tried) = sweep_verdict([0, 1, 2].iter(), |_| -> Result<SweepStep<()>> {
             calls += 1;
             Err(anyhow::anyhow!("TITLE.COM does not fit at 0xa000"))
         });

@@ -432,7 +432,9 @@ fn rip_title_at(
     // fall through to the on-demand bank path rather than failing the set.
     // (Catalogue-wide this is the only pc88 set whose declared music size
     // overflows its address, so the fallback is a safety net, not a family.)
-    let mut bgm_overflowed = false;
+    // The overflowing file is handed straight to the bank path below rather
+    // than read from disk a second time there.
+    let mut overflowed: Option<(u8, Vec<u8>)> = None;
     if let Some(bgm) = romlist
         .roms
         .iter()
@@ -442,7 +444,7 @@ fn rip_title_at(
             let data = read_set_file(set_dirs, &bgm.name)?;
             let start = addr as usize;
             if start + data.len() > 0x10000 {
-                bgm_overflowed = true;
+                overflowed = Some((song, data));
             } else {
                 bus.mem[start..start + data.len()].copy_from_slice(&data);
             }
@@ -458,7 +460,10 @@ fn rip_title_at(
     // port 0x00 from it, so a MUCOM set can want the bank on demand even though
     // we also seed MU_TOP. Gating solely on `bgm_addr.is_none()` made this path
     // unreachable for the one family hoot documents as using it.
-    if bgm_addr.is_none() || is_mucom || bgm_overflowed {
+    if bgm_addr.is_none() || is_mucom || overflowed.is_some() {
+        if let Some((off, data)) = overflowed.take() {
+            bus.bgm_banks.insert(off, data);
+        }
         for rom in &romlist.roms {
             if rom.kind != "bgm" {
                 continue;
@@ -469,6 +474,9 @@ fn rip_title_at(
             }
             // A missing or unreadable bank is not fatal: hoot simply has no
             // flag set for it and ignores the request.
+            if bus.bgm_banks.contains_key(&(off as u8)) {
+                continue;
+            }
             if let Ok(data) = read_set_file(set_dirs, &rom.name) {
                 bus.bgm_banks.insert(off as u8, data);
             }

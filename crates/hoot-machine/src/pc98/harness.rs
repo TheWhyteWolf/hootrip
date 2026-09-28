@@ -788,11 +788,36 @@ fn fm_sibling(dirs: &[PathBuf], song: &str) -> Option<(String, Vec<u8>)> {
     const FM_EXTS: &[&str] = &["MFM", "MF2", "MF1", "FM", "FMX", "FM2"];
     let base = song.rsplit(['\\', '/', ':']).next().unwrap_or(song);
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
-    FM_EXTS
+    let candidates: Vec<String> = FM_EXTS
         .iter()
         .map(|e| format!("{stem}.{e}"))
         .filter(|n| !n.eq_ignore_ascii_case(base))
-        .find_map(|n| read_set_file(dirs, &n).ok().map(|d| (n, d)))
+        .collect();
+
+    // One `stat` per candidate is cheap; the recursive scan is not, and most
+    // sets have none of these extensions. So take every cheap look first and
+    // fall back to a *single* walk per folder matching all candidates at once,
+    // rather than walking the tree once per extension.
+    for name in &candidates {
+        for dir in dirs {
+            let direct = dir.join(name);
+            if direct.is_file() {
+                if let Ok(data) = std::fs::read(&direct) {
+                    return Some((name.clone(), data));
+                }
+            }
+        }
+    }
+    let lower: Vec<String> = candidates.iter().map(|n| n.to_lowercase()).collect();
+    for dir in dirs {
+        if let Some(hit) = find_any_basename(dir, &lower, 2) {
+            let name = hit.file_name()?.to_string_lossy().into_owned();
+            if let Ok(data) = std::fs::read(&hit) {
+                return Some((name, data));
+            }
+        }
+    }
+    None
 }
 
 /// Render a set's archive folders for an error message.
@@ -826,6 +851,26 @@ fn find_basename(dir: &Path, lower: &str, depth: u32) -> Option<std::path::PathB
         }
     }
     None
+}
+
+/// Like [`find_basename`], but matching any of several lowercase names in one
+/// walk. Looking for six FM extensions one at a time meant six recursive
+/// listings of every set folder on every song of every sweep.
+fn find_any_basename(dir: &Path, lower: &[String], depth: u32) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if lower.contains(&entry.file_name().to_string_lossy().to_lowercase()) {
+            return Some(path);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    subdirs.iter().find_map(|sub| find_any_basename(sub, lower, depth - 1))
 }
 
 /// Rip one title from a `pc98dos` game. First pass is diagnostic-forward: it
