@@ -836,15 +836,15 @@ fn pc98_sweep(
             }
             "timeout" => {
                 timeouts += 1;
-                failures.push(format!("[timeout] {} ({kind})", g.name));
+                failures.push(format!("[timeout] {} ({kind}) [{archive}]", g.name));
             }
             "error" => {
                 errors += 1;
-                failures.push(format!("[error] {} ({kind}): {err}", g.name));
+                failures.push(format!("[error] {} ({kind}) [{archive}]: {err}", g.name));
             }
             _ => {
                 silent += 1;
-                failures.push(format!("[silent] {} ({kind}) [{tried} titles tried]", g.name));
+                failures.push(format!("[silent] {} ({kind}) [{archive}] [{tried} titles tried]", g.name));
             }
         }
         if oneline {
@@ -967,11 +967,11 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, max_titles: usize,
                 // also catches a set that drives the chip but never keys a
                 // note. Saying "no writes" here sent an earlier analysis
                 // hunting for a dead bus on sets that had a busy one.
-                failures.push(format!("[silent] {} ({kind}) [{tried} titles tried]", g.name));
+                failures.push(format!("[silent] {} ({kind}) [{archive}] [{tried} titles tried]", g.name));
             }
             SweepVerdict::Error(e) => {
                 errors += 1;
-                failures.push(format!("[error] {} ({kind}): {e}", g.name));
+                failures.push(format!("[error] {} ({kind}) [{archive}]: {e}", g.name));
             }
         }
     }

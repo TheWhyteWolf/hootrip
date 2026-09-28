@@ -1370,3 +1370,74 @@ it, already has a dedicated `(OPN)` entry playing those `F` files.
    item 1). Now partly overtaken: the sets §18.4 recovered were in that
    bucket, so the count needs redoing after a full pc98 sweep either way.
 4. **`odq_98`** — 192 titles, still the best non-MIDI lead.
+
+---
+
+## 19. The pc98 queue, re-measured
+
+The first full pc98 sweep with §18.3's `--titles` and §18.4's sibling list:
+
+**1,941 sets, 1,642 ok, 299 silent, 0 timeout, 0 errored** — up from
+1,542 ok / 399 silent. 80 of the newly-ok sets were silent on title 0 and
+audible on a later one; the remaining ~20 are FM arrangements that the old
+`.MFM`-only lookup could not find.
+
+| kind | ok | opna-ext | total |
+|---|---:|---:|---:|
+| `86` | 83 | 66 | 88 |
+| `opn` | 1,347 | 238 | 1,629 |
+| `opna` | 212 | 208 | 224 |
+
+### 19.1 — Re-bucketed
+
+§16.2's split, recomputed on the 299:
+
+| | sets | titles |
+|---|---:|---:|
+| MIDI variant, a working non-MIDI twin exists | 110 | 2,886 |
+| MIDI variant, no working twin | 36 | 640 |
+| **not a MIDI variant — the real driver queue** | **154** | **5,718** |
+
+The real queue was 234 sets / 9,154 titles in §16.2. It is now 154 / 5,718,
+and the duplicate bucket grew because recovering a set makes its MIDI siblings
+duplicates rather than losses.
+
+### 19.2 — Four sets are half the queue
+
+| titles | archive | set |
+|---:|---|---|
+| 898 | `metajo2_98` | Zwei Metajo (OPNA+SSGPCM) |
+| 898 | `metajo2_98` | Zwei Metajo (86) |
+| 514 | `metajo_98` | Metajo (OPNA+SSGPCM) |
+| 514 | `metajo_98` | Metajo (86) |
+
+**2,824 of the 5,718 titles — 49% — sit in two archives.** Every other set in
+the queue is under 65 titles. `odq_98`, §16.5's best lead at 192 titles, is no
+longer close to the top; these two archives are worth fifteen of it, and they
+are two problems rather than four, since each is one archive ripped under two
+board variants.
+
+Whether that is 2,824 titles of distinct music is the first thing to check —
+a set declaring 898 titles is unusual enough to warrant confirming the title
+list is not enumerating something other than songs.
+
+### 19.3 — One gamelist is not Shift_JIS
+
+`xml2/zzz_vermouth.xml` is UTF-8 with a BOM, while the other 556 gamelists are
+Shift_JIS. `decode_bytes` already handles it correctly — it reads the declared
+`encoding=` and only assumes Shift_JIS when none is given — but any *analysis*
+script that hardcodes Shift_JIS drops this one file silently, and with it all
+48 Vermouth GUS-simulation entries. That is exactly what happened while
+bucketing the queue above, and the missing 48 showed up only as a count that
+did not add up.
+
+### 19.4 — Order
+
+1. **`metajo_98` / `metajo2_98`** — 2,824 titles across two archives, after
+   confirming the title lists mean what they say.
+2. **The 73 zero-write pc88 sets**, minus the 10 their twins already cover
+   (§18.2).
+3. **`odq_98`** — 192 titles, 「サウンドボードがありません！」.
+4. **The 36 MIDI variants with no working twin**, of which some will have no
+   FM arrangement in this archive at all and should be excluded rather than
+   chased.
