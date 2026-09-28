@@ -372,13 +372,24 @@ impl MiniDos {
             let sig = rd8(mem, l);
             let block_owner = rd16(mem, l + 1);
             let block_size = rd16(mem, l + 3);
+            // Same corrupted-chain guard as `largest_free`. This walk sits on
+            // the AH=48h failure path, which is where NLP_HOOT lands after its
+            // 64 KB request is refused -- without the guard it spins here
+            // forever, and the spin is pure Rust, so the harness deadline
+            // (polled only between `cpu.run` calls) can never end the run.
+            if sig != b'M' && sig != b'Z' {
+                return best;
+            }
             if block_owner == 0 {
                 best = best.max(block_size);
             }
             if sig == b'Z' {
                 return best;
             }
-            seg = seg + 1 + block_size;
+            match Self::next_mcb(seg, block_size) {
+                Some(next) => seg = next,
+                None => return best,
+            }
         }
     }
 
@@ -396,14 +407,34 @@ impl MiniDos {
             let sig = rd8(mem, l);
             let block_owner = rd16(mem, l + 1);
             let block_size = rd16(mem, l + 3);
+            // A guest that scribbles over the arena leaves a chain that never
+            // reaches its 'Z'. Stop at the first header that isn't one, as
+            // `coalesce` already does -- walking on reads garbage as block
+            // sizes and, once `seg` wraps, revisits it forever. That spin is
+            // pure Rust, so the harness wall-clock deadline (which only polls
+            // inside the emulation pump) can never end the run.
+            if sig != b'M' && sig != b'Z' {
+                return best;
+            }
             if block_owner == 0 {
                 best = best.max(block_size);
             }
             if sig == b'Z' {
                 return best;
             }
-            seg = seg + 1 + block_size;
+            match Self::next_mcb(seg, block_size) {
+                Some(next) => seg = next,
+                None => return best,
+            }
         }
+    }
+
+    /// Step to the next MCB in the chain, or `None` if the step would leave the
+    /// arena or fail to advance. A zero-size block that isn't the last one would
+    /// otherwise inch `seg` forward one paragraph at a time and then wrap.
+    fn next_mcb(seg: u16, block_size: u16) -> Option<u16> {
+        let next = seg.checked_add(1)?.checked_add(block_size)?;
+        (next > seg && next < ARENA_END).then_some(next)
     }
 
     pub fn alloc(&self, mem: &mut [u8], paras: u16, owner: u16) -> Option<u16> {
@@ -413,6 +444,12 @@ impl MiniDos {
             let sig = rd8(mem, l);
             let block_owner = rd16(mem, l + 1);
             let block_size = rd16(mem, l + 3);
+            // Same corrupted-chain guard as `largest_free`: a header that is
+            // neither 'M' nor 'Z' means the arena was overwritten, and there is
+            // no allocation to hand out from garbage.
+            if sig != b'M' && sig != b'Z' {
+                return None;
+            }
             let is_last = sig == b'Z';
             if block_owner == 0 && block_size >= paras {
                 // Take this block; split off the remainder if worthwhile.
@@ -429,7 +466,10 @@ impl MiniDos {
             if is_last {
                 return None;
             }
-            seg = seg + 1 + block_size;
+            match Self::next_mcb(seg, block_size) {
+                Some(next) => seg = next,
+                None => return None,
+            }
         }
     }
 
@@ -1320,6 +1360,37 @@ pub enum ProgKind {
 mod tests {
     use super::*;
     use hoot_cpu::mock::MockCpu;
+
+    /// A guest that scribbles over the arena leaves an MCB chain with no 'Z'
+    /// terminator. Every walk must give up on the first bad header instead of
+    /// reading garbage as block sizes and revisiting segments forever once
+    /// `seg` wraps. This is not hypothetical: NLP_HOOT (Last Guardian 2) asks
+    /// for 64 KB via INT 21h AH=48h, the request is refused, and the failure
+    /// path calls `max_free_block` -- which spun for over an hour. The spin is
+    /// pure Rust, so the harness wall-clock deadline (polled only between
+    /// `cpu.run` calls) could never end the run.
+    #[test]
+    fn a_corrupted_mcb_chain_terminates_every_walk() {
+        let dos = MiniDos::new();
+        let mut cpu = MockCpu::new();
+        dos.init_arena(cpu.mem());
+        // Take a block, then obliterate the signature of the one after it.
+        let a = dos.alloc(cpu.mem(), 0x100, 0x1234).unwrap();
+        let next = a + 0x100; // the MCB of the remainder block
+        wr8(cpu.mem(), lin(next, 0), 0xCC);
+
+        // None of these may hang; the pre-fix code looped here forever.
+        let _ = dos.max_free_block(cpu.mem_ref());
+        let _ = dos.largest_free(cpu.mem_ref());
+        let _ = dos.alloc(cpu.mem(), 0x10, 0x5678);
+
+        // A zero-size block that is not the last one must not inch `seg`
+        // forward one paragraph at a time until it wraps.
+        dos.write_mcb(cpu.mem(), ARENA_START, b'M', 0x1111, 0);
+        assert_eq!(dos.max_free_block(cpu.mem_ref()), 0);
+        assert_eq!(dos.largest_free(cpu.mem_ref()), 0);
+        assert_eq!(dos.alloc(cpu.mem(), 0x10, 0x9999), None);
+    }
 
     #[test]
     fn arena_alloc_split_free_coalesce() {
