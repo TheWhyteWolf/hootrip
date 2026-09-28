@@ -1053,3 +1053,201 @@ is nearly exhausted. The console messages are the live lead now.
 `odq_98` is the one to start on: 192 titles behind a driver that says in plain
 words it cannot find the sound board, and board detection is a re-host concern
 with a history of reaching sets nobody was aiming at.
+
+---
+
+## 16. The queue is 41% MIDI variants, and the FM sibling is not always `.MFM`
+
+### 16.1 — The first full sweep that finished
+
+`pc98-sweep` had never completed. It stalled on `Last Guardian 2: Yomi no
+Fuuin`, whose NLP_HOOT stub asks for 64 KB via INT 21h AH=48h; the refusal path
+called `max_free_block`, which walked the MCB chain terminating only on a `'Z'`
+signature and spun forever once the guest had scribbled the arena. With that
+fixed the sweep runs end to end:
+
+**1,941 sets, 1,542 ok, 399 silent, 0 timeout, 0 errored.**
+
+| kind | ok | opna-ext | total |
+|---|---:|---:|---:|
+| `86` | 76 | 59 | 88 |
+| `opn` | 1,266 | 212 | 1,629 |
+| `opna` | 200 | 196 | 224 |
+
+**Do not read `0 timeout` as "nothing hung."** The wall-clock deadline is polled
+in `pump`, between `cpu.run` calls. The hang above was pure Rust *inside* one of
+them — pump's third iteration never began — so no deadline could have reported
+it. A spin below that line is invisible to `--deadline` by construction.
+
+### 16.2 — 108 of the 399 are soundtracks we already have
+
+165 of the 399 silent sets carry a `midiout` option, which is the whole of what
+`is_fm_variant` tests. Split by whether a working non-MIDI set exists in the
+same archive folder:
+
+| | sets | titles |
+|---|---:|---:|
+| a working non-MIDI twin exists | 108 | ~3,221 |
+| no working twin | 57 | ~1,169 |
+| not a MIDI variant — the real driver queue | 234 | ~9,154 |
+
+The 108 are not losses. They are the same music counted a second time under its
+SC-55/MT-32/GS arrangement, while the `(OPN)` entry beside them already rips.
+Counting them as failures inflates every family total that includes them — the
+same error §10 caught when `(SC-88)` slipped past an exclusion list and added
+three phantom sets to `valky_98`. **The queue is 291 sets, not 399.**
+
+### 16.3 — `.MFM` is one convention out of a dozen
+
+The FM-variant path binds `{stem}.MFM`, the Vermouth/TGLFMP2 convention. Across
+the sweep it failed 169 times over 55 archives and 84 distinct song files. For
+38 of those 84 a same-stem sibling is sitting in the folder under a different
+extension:
+
+| ext | files | | ext | files |
+|---|---:|---|---|---:|
+| `.FM` | 13 | | `.MD` | 4 |
+| `.FMX` | 11 | | `.A` / `.N` / `.26K` / `.M` | 2 each |
+| `.GS` | 6 | | `.L` / `.LA` | 1 each |
+| `.CM` | 5 | | | |
+| `.FM2` | 4 | | | |
+
+The remaining 46 use a different *stem*, not a different extension:
+`amrq_98`'s MIDI song is `MR01.TMD` and its FM soundtrack is `MR01F.TMD` — an
+`F` suffix. That set also already has a dedicated `(OPN)` entry playing those
+`F` files, so the FM-variant path is both unnecessary and wrong for it.
+
+### 16.4 — The `-m` drop fires even when the bind did not
+
+Binding the `.MFM` and dropping `-m` from the fmp shell are a designed pair: the
+comment says so. Only the bind is conditional. When the sibling is missing the
+code warns, keeps the MIDI song file, and still strips `-m`, so FMP3 installs as
+an FM driver holding MIDI data — neither variant's behaviour.
+
+This reaches **4 entries, all `edge98`** (the only warned sets whose shell
+starts with `fmp`). `edge98` ships `.M`/`.MD` and has no `.MFM` at all. All five
+Edge entries are silent today, including the genuine `(OPN)` one, so the
+mis-drive is not currently what keeps them quiet — but it will block recovery
+once the underlying cause is fixed.
+
+For the other 169 entries the shell is not `fmp`, so the drop is a no-op and the
+only effect is cosmetic: `fm_variant_game_name` strips the `(GS)`/`(MT-32)`
+marker and appends `(OPN)`. Harmless while they stay silent, and a false label
+the moment one starts producing audio — the failure mode a6a4ce1 fixed for
+ADPCM.
+
+### 16.5 — Where to start next, revised
+
+§15.5's ordering counted the 108 duplicates. Revised:
+
+1. **Exclude the MIDI variants that have a working twin.** 108 sets / ~3,221
+   titles of phantom queue, and every family total that includes them is wrong
+   until this is done. Measurement, not emulation.
+2. **The 57 MIDI variants with no working twin** — the only route to that music.
+   Fix the pair first (only drop `-m` when the bind succeeded), then teach the
+   sibling lookup the `.FM`/`.FMX`/`.M` conventions and the `F`-suffix stem.
+   Expect some of the 57 to have no FM soundtrack at all; those should be
+   excluded rather than chased.
+3. **`odq_98`** — 192 titles, 「サウンドボードがありません！」, unchanged from
+   §15.5 and still the best non-MIDI lead.
+
+A caution for whoever takes item 2: *silent* here means title 0 was silent. That
+is a weak signal for a set, and on pc88 it has already proved misleading — see
+§17.
+
+---
+
+## 17. pc88, which nobody has triaged
+
+Everything above is pc98. The pc88 sweep reads **531 sets, 398 ok, 132 silent,
+1 errored**, and no one has taken the silent 132 apart. A first pass says the
+pile is smaller than it looks and three of its pieces are not emulation work.
+
+### 17.1 — `silent` here means "title 0 was silent"
+
+`sweep` rips **title 0 only**. That is fine as a smoke test and misleading as
+triage, which is worth stating plainly before anyone builds on the number.
+
+The twin heuristic from §11 — a silent set whose same-archive twin rips — looked
+like it transferred: 7 silent pc88 sets have a working twin and 6 of the 7 are
+the `(OPNA)` side, the same shape as the 86-board split. Ripping them in full
+dissolves most of it:
+
+| set | writes | key-ons | verdict |
+|---|---:|---:|---|
+| `The Scheme (OPNA)` | 48,662 | 1,872 | **more** than its `(OPN)` twin's 9,108 |
+| `Kami no Machi (OPNA)` | 7,435 | 420 | more than its twin's 4,192 |
+| `Shutendouji (OPNA)` | 0 | 0 | a real zero-write failure |
+
+One genuine case, not seven. Title 0 of those sets is silent; the sets are not.
+Any pc88 triage that groups on the sweep's verdict inherits this error — re-rip
+before grouping, exactly as §10 says for the stub name.
+
+### 17.2 — 15 sets are not on disk
+
+14 pc88 sets (211 titles) name an archive folder that does not exist in this
+snapshot. This is not the unpack trap from the archive notes: extracted folders
+and `.zip` files coexist happily here (420 zips under `pc88/`, 1,709 under
+`pc98/`), and **none of the 92 absent pc88/pc98dos archives exists as a zip,
+lzh or 7z anywhere in the tree**. They are simply not in HootArchive20180626.
+Across pc88 and pc98dos that is 92 archives behind ~168 sets — a sourcing
+question, not a code one, and it caps what any amount of driver work can reach.
+
+`usd_98`'s missing file in §14 is the same phenomenon one level down.
+
+### 17.3 — One set is lost to a comma
+
+`Emerald Dragon (OPNA)` (71 titles) declares:
+
+```xml
+<romlist archive="emdr88,emdr98">
+```
+
+`archive` is a **list**. `find_set_dir` lowercases and compares the whole
+attribute against each folder name, so a comma can never match and the set is
+dropped as folderless. Both folders exist, and the split is real: 47 of the
+48 roms are in `emdr88`, and the 48th — `EMVI64.S` — is only in `emdr98`. So
+the semantics are "resolve each rom against every listed archive", not "pick
+one".
+
+Catalogue-wide this is **35 sets / 817 titles**, and for 33 of them (775 titles)
+every named folder is present. Only one is pc88; the other 34 are MSX, whose
+pattern is always `<game>_msx,fmpac_msx` — the game plus the FM-PAC BIOS. That
+makes the fix worth doing properly rather than special-casing pc88: it is the
+mechanism MSX support will need on day one.
+
+### 17.4 — Five driver kinds at 0/1, and the one hard error
+
+| kind | sets | titles | note |
+|---|---:|---:|---|
+| `8801-11` | 4 | 69 | Romancia, Thexder 88, SeeNa, American Truck |
+| `xanadu2` | 1 | 55 | |
+| `xanadu` | 1 | 9 | |
+| `8801-10` | 1 | 8 | Laptick |
+| `asteka2` | 1 | 8 | |
+
+The sweep's `0/1` line for each is itself an artefact of §17.2 — three of the
+four `8801-11` sets were skipped for a missing folder, so only one was swept.
+Seven of these eight sets are reachable; all seven are silent. These are
+bespoke Falcom-era drivers rather than a family, so they are 149 titles behind
+five separate problems, not one.
+
+The single hard error is worth more than its size:
+
+```
+[PC-8801] Gokudou Jintori (OPN): TITLE.COM does not fit at 0xa000
+```
+
+A loader bounds refusal, the same shape as §11.2's `.COM` that would not fit in
+65,408 bytes — which turned out to be the loader demanding a round number
+rather than the arena being short, and recovered 24 sets once corrected.
+
+### 17.5 — Order
+
+1. **The comma list.** 71 pc88 titles now, 775 catalogue-wide, and MSX cannot
+   start without it. Small, well-understood, and the semantics are pinned above.
+2. **`Gokudou Jintori`'s loader refusal.** One set, but §11.2 is precedent that
+   a loader bound is rarely about the set that reports it.
+3. **Re-rip the 132 silent in full before grouping them.** §17.1 says the
+   current verdicts cannot carry a triage. Cheap: pc88 sweeps in ~40 s.
+4. Leave the absent 14 alone until someone finds a fuller archive.
