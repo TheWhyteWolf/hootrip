@@ -1251,3 +1251,122 @@ rather than the arena being short, and recovered 24 sets once corrected.
 3. **Re-rip the 132 silent in full before grouping them.** §17.1 says the
    current verdicts cannot carry a triage. Cheap: pc88 sweeps in ~40 s.
 4. Leave the absent 14 alone until someone finds a fuller archive.
+
+---
+
+## 18. Title 0 was the measurement, not the music
+
+§17.1 warned that `sweep` rips title 0 only and that no triage should be built
+on its verdict. This section measures how wrong that verdict was, fixes the
+measurement, and reports what the pc88 queue actually looks like underneath.
+
+### 18.1 — 54 of the 127 silent pc88 sets are not silent
+
+Every set the sweep called silent was re-ripped in full — all titles, 20 s
+each, audibility gate unchanged. 137 sets ran (the 126 silent ones plus 11
+already-ok sets sharing their archive folders); of the 127 records matching a
+sweep `[silent]` line:
+
+| full-rip status | sets |
+|---|---:|
+| `ok` (every title audible) | 7 |
+| `partial` (some titles audible) | 47 |
+| `silent` (no title audible) | 73 |
+
+**54 sets, 586 titles, were audible all along.** Title 0 was the only thing
+wrong with them. Of the 3,425 titles in those 127 sets, 586 pass the gate, 27
+key on without loading a voice, and 317 are ADPCM-only.
+
+Six of the 54 are audible with **zero FM key-ons**: Replicart, Ashe, Super
+Mario Bros. Special, Ice Climber, Goonies — 61 titles whose music is entirely
+SSG. They are only counted because the gate tests SSG tone as well as FM
+key-on, which is the part of `audible.rs` that has been hardest to justify
+from FM sets alone.
+
+### 18.2 — The 73 that really are dead
+
+All 73 emit **zero register writes** across every title, which is a much
+sharper signature than the mixed pile of 132: nothing reaches the chip at all,
+so these are load/trigger failures rather than driver-configuration ones.
+
+| kind | sets |
+|---|---:|
+| `opn` | 54 |
+| `opna` | 19 |
+
+2,073 titles. The largest are `tnmbox_88` Telenet Music Box (OPNA) at 162,
+`snatcher` at 123 each side, `destjyo` Destruction Gekan (OPNA) at 80 and
+`lizard88` at 77.
+
+**Ten of the 73 have a same-archive twin that rips completely**, so the music
+is already in hand and only the board variant fails:
+
+| dead set | titles | working twin |
+|---|---:|---|
+| Telenet Music Box (OPNA) | 162 | (OPN) 32/162 |
+| Destruction Gekan (OPNA) | 80 | (OPN) 80/80 |
+| Shin Ku Gyoku Den (OPN) | 51 | (OPNA) 51/51 |
+| Yaksa (Music Mode) (OPN) | 21 | Yaksa (OPN) 19/22 |
+| RST88 Music Disk #1.3 (SPLIT i2) (OPNA) | 18 | (SPLIT f3) 36/36 |
+| Shutendouji (OPNA) | 15 | (OPN) 15/15 |
+| Hard Rank (OPNA) | 12 | (OPN) 11/11 |
+| Wingman Special (OPNA) | 9 | (OPN) 6/9 |
+
+Note the direction is not fixed: Destruction Gekan and Shutendouji fail on the
+OPNA side, Shin Ku Gyoku Den on the OPN side. This is the §11 twin split
+again, and unlike the version in §17.1 it now rests on full rips rather than
+on title 0, so it can carry a triage.
+
+### 18.3 — The sweep now tries until it hears something
+
+`sweep` and `pc98-sweep` take `--titles` (default 4) and stop at the first
+audible title. A healthy set still costs one rip, so only failing sets pay for
+the extra attempts:
+
+**pc88: 532 sets, 442 ok, 89 silent, 1 errored** — up from 399 ok / 132 silent,
+for 15 s of extra sweep time (29 s → 45 s). The summary line reports how many
+of the ok sets needed a later title (43) so the correction stays visible
+rather than quietly inflating the number.
+
+Four titles recovers 43 of the 54 the full census found. The remaining 11 hide
+their first audible track deeper; the census, not the sweep, is the authority
+on any individual set.
+
+### 18.4 — The FM sibling, and the switch that went with it
+
+§16.4's defect is fixed: the `-m` drop is now gated on the `.MFM` bind having
+succeeded, so FMP3 can no longer be installed as an FM driver while holding
+MIDI data.
+
+§16.3's extension survey is now acted on. The lookup tries `.MFM`, `.MF2`,
+`.MF1`, `.FM`, `.FMX` and `.FM2` against the song's stem, which lifts the
+midiout sets with a bindable FM arrangement from 32 to 98. Extensions naming a
+MIDI *target* — `.GS`, `.CM`, `.LA`, `.MD` — are deliberately excluded, since
+binding one recreates exactly the mis-pairing above.
+
+Measured on title 0 only, so the comparison is like for like:
+
+| set group | before | after |
+|---|---|---|
+| Branmarker 2 (98 + 9821) | 3/11 audible | **11/11** |
+| Heart de Ron (98 + 9821 + Yuu Disk 6) | 3/15 | **15/15** |
+
+Not every bind is sufficient: `sp_line_98`, `reno_98` and `lemmona_98` resolve
+a sibling and stay silent, so the FM arrangement reaching the driver is
+necessary but not the whole story for them.
+
+The `F`-suffix stem convention (`MR01.TMD` → `MR01F.TMD`, §16.3) is still
+unimplemented. It is worth less than it looks: `amrq_98`, the set that named
+it, already has a dedicated `(OPN)` entry playing those `F` files.
+
+### 18.5 — Order, revised again
+
+1. **The 73 zero-write pc88 sets**, minus the 10 whose twin already covers the
+   music — 63 sets, and a single shared symptom to chase rather than 132
+   assorted ones.
+2. **`Gokudou Jintori`'s loader refusal** (§17.4), unchanged and still the one
+   hard error.
+3. **Exclude MIDI variants with a working twin from the pc98 queue** (§16.5
+   item 1). Now partly overtaken: the sets §18.4 recovered were in that
+   bucket, so the count needs redoing after a full pc98 sweep either way.
+4. **`odq_98`** — 192 titles, still the best non-MIDI lead.
