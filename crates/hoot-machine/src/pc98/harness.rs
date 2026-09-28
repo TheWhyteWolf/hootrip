@@ -24,7 +24,7 @@
 //! approach the PC-88 harness used.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use hoot_cpu::{flag, np2::Np2Cpu, Reg16, Stop, X86Cpu};
@@ -745,23 +745,37 @@ fn load_device_drivers(eng: &mut Engine, romlist: &RomList, budget: u64) -> Vec<
 /// name a song under a subdirectory (`DEMO/USAUSA.BGM`); the driver still opens
 /// it by basename, so if the file is not directly in the set dir, search one
 /// level of subdirectories for a case-insensitive basename match.
-fn read_set_file(dir: &Path, name: &str) -> Result<Vec<u8>> {
+/// Read a set file, trying each of the set's archives in turn.
+///
+/// `romlist archive=` may name several folders and a rom can be in any of
+/// them, so a miss in the first is not a miss (see `Catalogue::find_set_dirs`).
+fn read_set_file(dirs: &[PathBuf], name: &str) -> Result<Vec<u8>> {
     let base = name.rsplit(['\\', '/', ':']).next().unwrap_or(name);
-    let direct = dir.join(base);
-    if direct.is_file() {
-        return std::fs::read(&direct).with_context(|| format!("reading {}", direct.display()));
-    }
-    // Honor an explicit relative subpath from the XML (e.g. `DEMO/USAUSA.BGM`).
     let rel = name.replace('\\', "/");
-    let relp = dir.join(&rel);
-    if relp.is_file() {
-        return std::fs::read(&relp).with_context(|| format!("reading {}", relp.display()));
-    }
     let lower = base.to_lowercase();
-    if let Some(hit) = find_basename(dir, &lower, 2) {
-        return std::fs::read(&hit).with_context(|| format!("reading {}", hit.display()));
+    for dir in dirs {
+        let direct = dir.join(base);
+        if direct.is_file() {
+            return std::fs::read(&direct).with_context(|| format!("reading {}", direct.display()));
+        }
+        // Honor an explicit relative subpath from the XML (e.g. `DEMO/USAUSA.BGM`).
+        let relp = dir.join(&rel);
+        if relp.is_file() {
+            return std::fs::read(&relp).with_context(|| format!("reading {}", relp.display()));
+        }
+        if let Some(hit) = find_basename(dir, &lower, 2) {
+            return std::fs::read(&hit).with_context(|| format!("reading {}", hit.display()));
+        }
     }
-    bail!("file {name:?} not found in {}", dir.display())
+    bail!("file {name:?} not found in {}", describe_dirs(dirs))
+}
+
+/// Render a set's archive folders for an error message.
+fn describe_dirs(dirs: &[PathBuf]) -> String {
+    if dirs.is_empty() {
+        return "(no archive folder)".into();
+    }
+    dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Search `dir` (and up to `depth` levels of subdirectories) for a file whose
@@ -794,7 +808,7 @@ fn find_basename(dir: &Path, lower: &str, depth: u32) -> Option<std::path::PathB
 /// returns everything observed so the strategy can be tuned per driver family.
 pub fn rip_title(
     game: &Game,
-    set_dir: &Path,
+    set_dirs: &[PathBuf],
     title_code: u64,
     opts: &Pc98RipOptions,
 ) -> Result<Pc98RipOutcome> {
@@ -822,7 +836,7 @@ pub fn rip_title(
     set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
 
-    let mut notes = materialize(&mut dos, romlist, set_dir);
+    let mut notes = materialize(&mut dos, romlist, set_dirs);
     let mut song_file = selected_song(romlist, title_code);
 
     // FM-variant: the Vermouth/TGLFMP2 sets play `.MGS` MIDI data through FMP3 in
@@ -834,7 +848,7 @@ pub fn rip_title(
         if let Some(sf) = &song_file {
             let stem = sf.rsplit_once('.').map(|(s, _)| s).unwrap_or(sf);
             let mfm = format!("{stem}.MFM");
-            match read_set_file(set_dir, &mfm) {
+            match read_set_file(set_dirs, &mfm) {
                 Ok(data) => {
                     dos.add_file(&mfm, data);
                     song_file = Some(mfm);
@@ -1038,7 +1052,7 @@ pub fn rip_title(
 
 /// Materialize a set's `file` roms into the virtual disk and apply `binary`
 /// byte patches. Returns notes about any files that were missing on disk.
-fn materialize(dos: &mut MiniDos, romlist: &RomList, set_dir: &Path) -> String {
+fn materialize(dos: &mut MiniDos, romlist: &RomList, set_dirs: &[PathBuf]) -> String {
     let mut last_file: Option<String> = None;
     let mut notes = String::new();
     for rom in &romlist.roms {
@@ -1048,7 +1062,7 @@ fn materialize(dos: &mut MiniDos, romlist: &RomList, set_dir: &Path) -> String {
             // an install-time-reading stub can validate it. See bind_rom_handles.
             "file" | "conin" => {
                 let base = rom.name.rsplit(['\\', '/', ':']).next().unwrap_or(&rom.name);
-                match read_set_file(set_dir, &rom.name) {
+                match read_set_file(set_dirs, &rom.name) {
                     Ok(data) => {
                         dos.add_file(base, data);
                         last_file = Some(base.to_uppercase());
@@ -1300,7 +1314,7 @@ pub struct TraceReport {
 /// this isolates one program's startup for diagnosis.
 pub fn trace_title(
     game: &Game,
-    set_dir: &Path,
+    set_dirs: &[PathBuf],
     title_code: u64,
     cmd_index: usize,
     max_steps: u64,
@@ -1324,7 +1338,7 @@ pub fn trace_title(
     dos.install_trampolines(cpu.mem());
     set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
-    let _ = materialize(&mut dos, romlist, set_dir);
+    let _ = materialize(&mut dos, romlist, set_dirs);
     // Bind rom→handle as the capture path does, so `--trace` reflects the real
     // install path (an install-time-reading stub takes a different branch when a
     // handle is unbound — without this the trace is actively misleading).
@@ -1517,7 +1531,7 @@ pub struct CaptureTrace {
 /// whether the song data was read, where the CPU spends its time).
 pub fn trace_capture(
     game: &Game,
-    set_dir: &Path,
+    set_dirs: &[PathBuf],
     title_code: u64,
     max_steps: u64,
     opts: &Pc98RipOptions,
@@ -1540,14 +1554,14 @@ pub fn trace_capture(
     dos.install_trampolines(cpu.mem());
     set_sound_bios(&mut cpu, opts.dummy_sndrom);
     dos.install_dos_structures(cpu.mem());
-    let _ = materialize(&mut dos, romlist, set_dir);
+    let _ = materialize(&mut dos, romlist, set_dirs);
     let mut song_file = selected_song(romlist, title_code);
     let fm_variant = opts.fm_variant;
     if fm_variant {
         if let Some(sf) = &song_file {
             let stem = sf.rsplit_once('.').map(|(s, _)| s).unwrap_or(sf);
             let mfm = format!("{stem}.MFM");
-            if let Ok(data) = read_set_file(set_dir, &mfm) {
+            if let Ok(data) = read_set_file(set_dirs, &mfm) {
                 dos.add_file(&mfm, data);
                 song_file = Some(mfm);
             }

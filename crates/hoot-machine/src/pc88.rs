@@ -299,7 +299,7 @@ const PROBE_SECONDS: f64 = 12.0;
 /// the probe, so their behaviour is unchanged.
 pub fn rip_title(
     game: &Game,
-    set_dir: &std::path::Path,
+    set_dirs: &[std::path::PathBuf],
     title_code: u64,
     opts: &RipOptions,
 ) -> Result<RipOutcome> {
@@ -307,10 +307,10 @@ pub fn rip_title(
         .mdata_addr
         .or(if is_mucom(game) { Some(MUCOM_DATA_ADDR) } else { declared_bgm_addr(game) });
     if explicit.is_some() {
-        return rip_title_at(game, set_dir, title_code, opts, explicit, opts.seconds);
+        return rip_title_at(game, set_dirs, title_code, opts, explicit, opts.seconds);
     }
 
-    let plain = rip_title_at(game, set_dir, title_code, opts, None, opts.seconds)?;
+    let plain = rip_title_at(game, set_dirs, title_code, opts, None, opts.seconds)?;
     if !hoot_log::audibility(&plain.log).is_silent() {
         return Ok(plain);
     }
@@ -322,7 +322,7 @@ pub fn rip_title(
         // catalogue names a bgm file the archive does not carry from a benign
         // `silent` census entry into `error` — a regression against the plain
         // capture we already hold.
-        let Ok(probe) = rip_title_at(game, set_dir, title_code, opts, Some(cand), probe_secs)
+        let Ok(probe) = rip_title_at(game, set_dirs, title_code, opts, Some(cand), probe_secs)
         else {
             continue;
         };
@@ -342,7 +342,7 @@ pub fn rip_title(
         if let Some(other) = other_title_code(game, title_code) {
             // Cannot rip the other title, so cannot show the stream depends on
             // which song was selected: leave the address unproven.
-            let Ok(probe2) = rip_title_at(game, set_dir, other, opts, Some(cand), probe_secs)
+            let Ok(probe2) = rip_title_at(game, set_dirs, other, opts, Some(cand), probe_secs)
             else {
                 continue;
             };
@@ -350,7 +350,7 @@ pub fn rip_title(
                 continue;
             }
         }
-        let Ok(mut full) = rip_title_at(game, set_dir, title_code, opts, Some(cand), opts.seconds)
+        let Ok(mut full) = rip_title_at(game, set_dirs, title_code, opts, Some(cand), opts.seconds)
         else {
             continue;
         };
@@ -381,7 +381,7 @@ fn same_stream(a: &RegisterLog, b: &RegisterLog) -> bool {
 /// whose music lives inside a code rom.
 fn rip_title_at(
     game: &Game,
-    set_dir: &std::path::Path,
+    set_dirs: &[std::path::PathBuf],
     title_code: u64,
     opts: &RipOptions,
     bgm_addr: Option<i64>,
@@ -409,7 +409,7 @@ fn rip_title_at(
         if offset < 0 {
             bail!("negative code offset for {}", rom.name);
         }
-        let data = read_set_file(set_dir, &rom.name)?;
+        let data = read_set_file(set_dirs, &rom.name)?;
         let start = offset as usize;
         if start + data.len() > 0x10000 {
             bail!("{} does not fit at {:#x}", rom.name, start);
@@ -430,7 +430,7 @@ fn rip_title_at(
         .find(|r| r.kind == "bgm" && r.offset == Some(song as i64))
     {
         if let Some(addr) = bgm_addr {
-            let data = read_set_file(set_dir, &bgm.name)?;
+            let data = read_set_file(set_dirs, &bgm.name)?;
             let start = addr as usize;
             if start + data.len() > 0x10000 {
                 bail!("{} does not fit at {:#x}", bgm.name, start);
@@ -459,7 +459,7 @@ fn rip_title_at(
             }
             // A missing or unreadable bank is not fatal: hoot simply has no
             // flag set for it and ignores the request.
-            if let Ok(data) = read_set_file(set_dir, &rom.name) {
+            if let Ok(data) = read_set_file(set_dirs, &rom.name) {
                 bus.bgm_banks.insert(off as u8, data);
             }
         }
@@ -679,21 +679,35 @@ impl Runner<'_> {
     }
 }
 
-fn read_set_file(dir: &std::path::Path, name: &str) -> Result<Vec<u8>> {
-    // Set files are case-inconsistent between XML and disk; try exact first.
-    let direct = dir.join(name);
-    if direct.is_file() {
-        return std::fs::read(&direct).with_context(|| format!("reading {}", direct.display()));
-    }
-    let lower = name.to_lowercase();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().to_lowercase() == lower {
-            return std::fs::read(entry.path())
-                .with_context(|| format!("reading {}", entry.path().display()));
+/// Read a set file, trying each of the set's archives in turn.
+///
+/// `romlist archive=` may name several folders and a rom can be in any of
+/// them, so a miss in the first is not a miss (see `Catalogue::find_set_dirs`).
+fn read_set_file(dirs: &[std::path::PathBuf], name: &str) -> Result<Vec<u8>> {
+    for dir in dirs {
+        // Set files are case-inconsistent between XML and disk; try exact first.
+        let direct = dir.join(name);
+        if direct.is_file() {
+            return std::fs::read(&direct).with_context(|| format!("reading {}", direct.display()));
+        }
+        let lower = name.to_lowercase();
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().to_lowercase() == lower {
+                return std::fs::read(entry.path())
+                    .with_context(|| format!("reading {}", entry.path().display()));
+            }
         }
     }
-    bail!("file {name:?} not found in {}", dir.display())
+    bail!("file {name:?} not found in {}", describe_dirs(dirs))
+}
+
+/// Render a set's archive folders for an error message.
+fn describe_dirs(dirs: &[std::path::PathBuf]) -> String {
+    if dirs.is_empty() {
+        return "(no archive folder)".into();
+    }
+    dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]

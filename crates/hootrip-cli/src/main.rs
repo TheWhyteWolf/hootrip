@@ -355,9 +355,10 @@ fn pc98_diag(
         .as_ref()
         .and_then(|r| r.archive.as_deref())
         .context("game has no romlist archive")?;
-    let set_dir = cat
-        .find_set_dir(archive)
-        .with_context(|| format!("set folder {archive:?} not found on disk"))?;
+    let set_dirs = cat.find_set_dirs(archive);
+    if set_dirs.is_empty() {
+        anyhow::bail!("set folder {archive:?} not found on disk");
+    }
 
     let titles = g.expanded_titles();
     let t = titles.get(index).with_context(|| format!("no title index {index}"))?;
@@ -388,7 +389,7 @@ fn pc98_diag(
         funcvect.map(|v| format!("{v:#04x}")).unwrap_or_else(|| "-".into()));
 
     if let Some(cmd_index) = trace {
-        let r = hoot_machine::pc98::trace_title(g, &set_dir, t.code, cmd_index, trace_steps, &opts, cmd_override)?;
+        let r = hoot_machine::pc98::trace_title(g, &set_dirs, t.code, cmd_index, trace_steps, &opts, cmd_override)?;
         println!("\n  trace of shell[{cmd_index}]: {}", r.cmd);
         println!("  stepped {} instructions{}  ({} FM writes)",
             r.steps, if r.stalled { "  [STALLED]" } else { "" }, r.fm_writes);
@@ -424,7 +425,7 @@ fn pc98_diag(
 
     if trace_capture {
         let steps = if trace_steps == 5_000_000 { 3_000_000 } else { trace_steps };
-        let r = hoot_machine::pc98::trace_capture(g, &set_dir, t.code, steps, &opts)?;
+        let r = hoot_machine::pc98::trace_capture(g, &set_dirs, t.code, steps, &opts)?;
         println!("\n  shell chain:");
         for (cmd, res) in &r.shell {
             println!("    {cmd:<24} -> {res}");
@@ -456,7 +457,7 @@ fn pc98_diag(
         return Ok(());
     }
 
-    let o = hoot_machine::pc98::rip_title(g, &set_dir, t.code, &opts)?;
+    let o = hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts)?;
 
     println!("\n  shell chain:");
     for s in &o.shell {
@@ -559,7 +560,7 @@ fn pc98_diag(
 fn find_pc98dos<'a>(
     cat: &'a Catalogue,
     query: &str,
-) -> Result<(&'a hoot_xml::Game, PathBuf)> {
+) -> Result<(&'a hoot_xml::Game, Vec<PathBuf>)> {
     let lc = query.to_lowercase();
     let (_, g) = cat
         .games
@@ -571,10 +572,11 @@ fn find_pc98dos<'a>(
         .as_ref()
         .and_then(|r| r.archive.as_deref())
         .context("game has no romlist archive")?;
-    let set_dir = cat
-        .find_set_dir(archive)
-        .with_context(|| format!("set folder {archive:?} not found on disk"))?;
-    Ok((g, set_dir))
+    let set_dirs = cat.find_set_dirs(archive);
+    if set_dirs.is_empty() {
+        anyhow::bail!("set folder {archive:?} not found on disk");
+    }
+    Ok((g, set_dirs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -595,7 +597,7 @@ fn pc98_rip(
     use hoot_log::s98::{write_s98, S98Tags};
     use hoot_log::{vgm_volume_modifier, write_vgz, Gd3};
 
-    let (g, set_dir) = find_pc98dos(cat, game_query)?;
+    let (g, set_dirs) = find_pc98dos(cat, game_query)?;
 
     let funcvect = g
         .options
@@ -652,7 +654,7 @@ fn pc98_rip(
         } else {
             t.name.clone()
         };
-        let mut outcome = hoot_machine::pc98::rip_title(g, &set_dir, t.code, &opts)?;
+        let mut outcome = hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts)?;
         let raw_writes = outcome.log.writes.len();
         outcome.log.volume_modifier = volmod;
 
@@ -741,7 +743,10 @@ fn pc98_sweep(
             }
         }
         let Some(archive) = g.romlist.as_ref().and_then(|r| r.archive.as_deref()) else { continue };
-        let Some(set_dir) = cat.find_set_dir(archive) else { continue };
+        let set_dirs = cat.find_set_dirs(archive);
+        if set_dirs.is_empty() {
+            continue;
+        }
         let Some(t0) = g.expanded_titles().into_iter().next() else { continue };
         // Stable ordinal (independent of skip) so a process-per-set driver can
         // address each set by index across separate invocations.
@@ -779,7 +784,7 @@ fn pc98_sweep(
         if std::env::var_os("HOOTRIP_SWEEP_TRACE").is_some() {
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
         }
-        let (status, ext) = match hoot_machine::pc98::rip_title(g, &set_dir, t0.code, &opts) {
+        let (status, ext) = match hoot_machine::pc98::rip_title(g, &set_dirs, t0.code, &opts) {
             Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
                 ok += 1;
                 ke.0 += 1;
@@ -851,9 +856,10 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
         let Some(archive) = g.romlist.as_ref().and_then(|r| r.archive.as_deref()) else {
             continue;
         };
-        let Some(set_dir) = cat.find_set_dir(archive) else {
+        let set_dirs = cat.find_set_dirs(archive);
+        if set_dirs.is_empty() {
             continue;
-        };
+        }
         let Some(t0) = g.expanded_titles().into_iter().next() else {
             continue;
         };
@@ -863,7 +869,7 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
         ke.1 += 1;
 
         let opts = hoot_machine::RipOptions { seconds, clockmul: clockmul_of(g), ..Default::default() };
-        match hoot_machine::rip_title(g, &set_dir, t0.code, &opts) {
+        match hoot_machine::rip_title(g, &set_dirs, t0.code, &opts) {
             Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
                 ok += 1;
                 ke.0 += 1;
@@ -898,7 +904,7 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
     }
 }
 
-fn find_pc88<'a>(cat: &'a Catalogue, query: &str) -> Result<(&'a hoot_xml::Game, PathBuf)> {
+fn find_pc88<'a>(cat: &'a Catalogue, query: &str) -> Result<(&'a hoot_xml::Game, Vec<PathBuf>)> {
     let lc = query.to_lowercase();
     let (_, g) = cat
         .games
@@ -913,10 +919,11 @@ fn find_pc88<'a>(cat: &'a Catalogue, query: &str) -> Result<(&'a hoot_xml::Game,
         .as_ref()
         .and_then(|r| r.archive.as_deref())
         .context("game has no romlist archive")?;
-    let set_dir = cat
-        .find_set_dir(archive)
-        .with_context(|| format!("set folder {archive:?} not found on disk"))?;
-    Ok((g, set_dir))
+    let set_dirs = cat.find_set_dirs(archive);
+    if set_dirs.is_empty() {
+        anyhow::bail!("set folder {archive:?} not found on disk");
+    }
+    Ok((g, set_dirs))
 }
 
 fn clockmul_of(g: &hoot_xml::Game) -> u32 {
@@ -991,13 +998,13 @@ fn compare_cmd(
         .map(|(t, ..)| *t as f64 * ref_parsed.sync_secs)
         .unwrap_or(0.0);
 
-    let (g, set_dir) = find_pc88(cat, game_query)?;
+    let (g, set_dirs) = find_pc88(cat, game_query)?;
     let titles = g.expanded_titles();
     let t = titles.get(index).with_context(|| format!("no title index {index}"))?;
 
     let secs = seconds.unwrap_or(ref_len_s.max(1.0));
     let opts = hoot_machine::RipOptions { seconds: secs, clockmul: clockmul_of(g), ..Default::default() };
-    let outcome = hoot_machine::rip_title(g, &set_dir, t.code, &opts)?;
+    let outcome = hoot_machine::rip_title(g, &set_dirs, t.code, &opts)?;
     let ours = read_s98(&write_s98(&outcome.log, &S98Tags::default())?)?;
 
     let r = compare(&ours, &ref_parsed);
@@ -1031,7 +1038,7 @@ fn rip(
     use hoot_log::s98::{write_s98, S98Tags};
     use hoot_log::{write_vgz, Gd3};
 
-    let (g, set_dir) = find_pc88(cat, game_query)?;
+    let (g, set_dirs) = find_pc88(cat, game_query)?;
     let opts = hoot_machine::RipOptions {
         seconds,
         clockmul: clockmul_of(g),
@@ -1052,7 +1059,7 @@ fn rip(
 
     for (i, t) in selected.iter() {
         let i = *i;
-        let outcome = hoot_machine::rip_title(g, &set_dir, t.code, &opts)?;
+        let outcome = hoot_machine::rip_title(g, &set_dirs, t.code, &opts)?;
         let n_writes = outcome.log.writes.len();
 
         let system = g
@@ -1386,11 +1393,12 @@ fn rip_one_set(
         err: String::new(),
     };
 
-    let Some(set_dir) = g
+    let Some(set_dirs) = g
         .romlist
         .as_ref()
         .and_then(|r| r.archive.as_deref())
-        .and_then(|a| cat.find_set_dir(a))
+        .map(|a| cat.find_set_dirs(a))
+        .filter(|d| !d.is_empty())
     else {
         sum.status = "nofolder".into();
         return sum;
@@ -1448,7 +1456,7 @@ fn rip_one_set(
                     continue;
                 }
                 let track_name = if opts.fm_variant { fm_variant_track_name(&t.name) } else { t.name.clone() };
-                let mut outcome = match hoot_machine::pc98::rip_title(g, &set_dir, t.code, &opts) {
+                let mut outcome = match hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts) {
                     Ok(o) => o,
                     Err(e) => {
                         // A rom the catalogue names may simply not be in the
@@ -1521,7 +1529,7 @@ fn rip_one_set(
                     sum.stop_skipped += 1;
                     continue;
                 }
-                let mut outcome = match hoot_machine::rip_title(g, &set_dir, t.code, &opts) {
+                let mut outcome = match hoot_machine::rip_title(g, &set_dirs, t.code, &opts) {
                     Ok(o) => o,
                     Err(e) => {
                         // A rom the catalogue names may simply not be in the

@@ -89,7 +89,37 @@ impl Catalogue {
 
     /// Find the on-disk folder for a game's `romlist archive=` name.
     /// hoot scans all data dirs, so the archive name is matched in each.
+    ///
+    /// For a multi-archive set this is only the *first* folder; a rom may live
+    /// in any of them, so anything that reads set files wants
+    /// [`find_set_dirs`](Self::find_set_dirs).
     pub fn find_set_dir(&self, archive: &str) -> Option<PathBuf> {
+        self.find_set_dirs(archive).into_iter().next()
+    }
+
+    /// Resolve a `romlist archive=` attribute to every folder it names.
+    ///
+    /// The attribute is a comma-separated *list*, and a set's roms are spread
+    /// across all of them: `Emerald Dragon (OPNA)` declares `emdr88,emdr98`
+    /// and keeps 47 of its 48 roms in `emdr88` with `EMVI64.S` only in
+    /// `emdr98`. The MSX sets use the same mechanism to pull in the FM-PAC
+    /// BIOS alongside the game (`<game>_msx,fmpac_msx`). Comparing the whole
+    /// attribute against a folder name matches nothing for these, which
+    /// silently dropped the set as if its archive were missing.
+    ///
+    /// Names that resolve to no folder are skipped rather than failing the
+    /// lot: a set whose optional second archive is absent should still load
+    /// what it has.
+    pub fn find_set_dirs(&self, archive: &str) -> Vec<PathBuf> {
+        archive
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .filter_map(|a| self.find_one_set_dir(a))
+            .collect()
+    }
+
+    fn find_one_set_dir(&self, archive: &str) -> Option<PathBuf> {
         let lower = archive.to_lowercase();
         for (dir, sets) in &self.set_dirs {
             if let Some(name) = sets.iter().find(|s| s.to_lowercase() == lower) {
