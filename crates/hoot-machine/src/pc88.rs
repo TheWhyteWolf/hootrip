@@ -424,6 +424,15 @@ fn rip_title_at(
     // MU_TOP (0xC205), and its 127-byte patch triggers play with `CALL 0xEEA7`
     // — a routine real hoot injects but that is otherwise unmapped RAM here.
     let is_mucom = is_mucom(game);
+    // A song too big for the window its `mdata_addr` names is not a broken
+    // set — it is a set that does not use the preload mechanism at all.
+    // `gokudo88` declares `mdata_addr=0xa000` with `mfile_size=0xb000`, a
+    // window that cannot exist in a 64 KB address space, and its MAIN.COM is
+    // 41,984 bytes; the file has to live in a side buffer and be paged in, so
+    // fall through to the on-demand bank path rather than failing the set.
+    // (Catalogue-wide this is the only pc88 set whose declared music size
+    // overflows its address, so the fallback is a safety net, not a family.)
+    let mut bgm_overflowed = false;
     if let Some(bgm) = romlist
         .roms
         .iter()
@@ -433,9 +442,10 @@ fn rip_title_at(
             let data = read_set_file(set_dirs, &bgm.name)?;
             let start = addr as usize;
             if start + data.len() > 0x10000 {
-                bail!("{} does not fit at {:#x}", bgm.name, start);
+                bgm_overflowed = true;
+            } else {
+                bus.mem[start..start + data.len()].copy_from_slice(&data);
             }
-            bus.mem[start..start + data.len()].copy_from_slice(&data);
         }
     }
 
@@ -448,7 +458,7 @@ fn rip_title_at(
     // port 0x00 from it, so a MUCOM set can want the bank on demand even though
     // we also seed MU_TOP. Gating solely on `bgm_addr.is_none()` made this path
     // unreachable for the one family hoot documents as using it.
-    if bgm_addr.is_none() || is_mucom {
+    if bgm_addr.is_none() || is_mucom || bgm_overflowed {
         for rom in &romlist.roms {
             if rom.kind != "bgm" {
                 continue;
