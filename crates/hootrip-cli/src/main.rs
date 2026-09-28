@@ -42,6 +42,11 @@ enum Cmd {
         /// Only sweep sets whose name contains this substring
         #[arg(long)]
         filter: Option<String>,
+        /// Titles to try before calling a set silent. Title 0 is often the
+        /// driver's stop track, so one title is not a verdict. Costs nothing
+        /// for a healthy set — the search stops at the first audible title.
+        #[arg(long, default_value_t = 4)]
+        titles: usize,
         /// Print each failing set's diagnostics
         #[arg(long)]
         verbose: bool,
@@ -100,6 +105,9 @@ enum Cmd {
         /// Only sweep sets whose name contains this substring
         #[arg(long)]
         filter: Option<String>,
+        /// Titles to try before calling a set silent (see `sweep --titles`).
+        #[arg(long, default_value_t = 4)]
+        titles: usize,
         /// Only these comma-separated driver kinds (default: opn,opna,86)
         #[arg(long, default_value = "opn,opna,86")]
         kinds: String,
@@ -304,15 +312,15 @@ fn main() -> Result<()> {
         Cmd::Compare { game, index, reference, seconds } => {
             compare_cmd(&cat, &game, index, &reference, seconds)?
         }
-        Cmd::Sweep { seconds, filter, verbose } => sweep(&cat, seconds, filter.as_deref(), verbose),
+        Cmd::Sweep { seconds, filter, titles, verbose } => sweep(&cat, seconds, filter.as_deref(), titles, verbose),
         Cmd::Pc98 { game, index, seconds, setup_seconds, sound_vector, trace, trace_steps, cmd, trace_capture } => {
             pc98_diag(&cat, &game, index, seconds, setup_seconds, sound_vector.as_deref(), trace, trace_steps, cmd.as_deref(), trace_capture)?
         }
         Cmd::Pc98Rip { game, index, seconds, out, format, headroom_db, min_loop, no_loop, opn_clock_hz, verbose } => {
             pc98_rip(&cat, &game, index, seconds, &out, &format, headroom_db, min_loop, no_loop, opn_clock_hz, verbose)?
         }
-        Cmd::Pc98Sweep { seconds, filter, kinds, limit, skip, oneline, verbose } => {
-            pc98_sweep(&cat, seconds, filter.as_deref(), &kinds, limit, skip, oneline, verbose)
+        Cmd::Pc98Sweep { seconds, filter, titles, kinds, limit, skip, oneline, verbose } => {
+            pc98_sweep(&cat, seconds, filter.as_deref(), titles, &kinds, limit, skip, oneline, verbose)
         }
         Cmd::RipOne { ordinal, out, seconds, format, headroom_db, min_loop, no_loop, deadline } => {
             let sum = rip_one_set(&cat, ordinal, &out, seconds, &format, headroom_db, min_loop, no_loop, deadline);
@@ -714,6 +722,7 @@ fn pc98_sweep(
     cat: &Catalogue,
     seconds: f64,
     filter: Option<&str>,
+    max_titles: usize,
     kinds: &str,
     limit: usize,
     skip: usize,
@@ -721,6 +730,7 @@ fn pc98_sweep(
     verbose: bool,
 ) {
     let filt = filter.map(|f| f.to_lowercase());
+    let max_titles = max_titles.max(1);
     let want: Vec<&str> = kinds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     let mut matched = 0; // sets matching the filter, before skip
     let mut total = 0;
@@ -728,6 +738,8 @@ fn pc98_sweep(
     let mut silent = 0;
     let mut errors = 0;
     let mut timeouts = 0;
+    // Sets that needed more than title 0 to prove themselves.
+    let mut late = 0;
     // (ok, opna-extended-used, total) per driver kind.
     let mut by_kind: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
@@ -747,7 +759,10 @@ fn pc98_sweep(
         if set_dirs.is_empty() {
             continue;
         }
-        let Some(t0) = g.expanded_titles().into_iter().next() else { continue };
+        let titles = g.expanded_titles();
+        if titles.is_empty() {
+            continue;
+        }
         // Stable ordinal (independent of skip) so a process-per-set driver can
         // address each set by index across separate invocations.
         let ordinal = matched;
@@ -784,32 +799,54 @@ fn pc98_sweep(
         if std::env::var_os("HOOTRIP_SWEEP_TRACE").is_some() {
             eprintln!("  >> [{ordinal}] {} ({kind})", g.name);
         }
-        let (status, ext) = match hoot_machine::pc98::rip_title(g, &set_dirs, t0.code, &opts) {
-            Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
+        // Title 0 is not a verdict (see [`sweep_verdict`]); keep going until a
+        // title is audible. A timeout ends the search — the set is spinning,
+        // and the next title would only spend the same budget again.
+        let mut outcome = None;
+        let mut tried = 0usize;
+        for t in titles.iter().take(max_titles) {
+            tried += 1;
+            match hoot_machine::pc98::rip_title(g, &set_dirs, t.code, &opts) {
+                Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
+                    outcome = Some(("ok", o.log.writes.iter().any(|w| w.port == 1), String::new()));
+                    break;
+                }
+                Ok(o) if o.timed_out => {
+                    outcome = Some(("timeout", false, String::new()));
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    outcome = Some(("error", false, format!("{e}")));
+                    break;
+                }
+            }
+        }
+        let (status, ext, err) = outcome.unwrap_or(("silent", false, String::new()));
+        match status {
+            "ok" => {
                 ok += 1;
                 ke.0 += 1;
-                let ext = o.log.writes.iter().any(|w| w.port == 1);
                 if ext {
                     ke.1 += 1; // OPNA extended channels actually driven
                 }
-                ("ok", ext)
+                if tried > 1 {
+                    late += 1;
+                }
             }
-            Ok(o) if o.timed_out => {
+            "timeout" => {
                 timeouts += 1;
                 failures.push(format!("[timeout] {} ({kind})", g.name));
-                ("timeout", false)
             }
-            Ok(_) => {
-                silent += 1;
-                failures.push(format!("[silent] {} ({kind})", g.name));
-                ("silent", false)
-            }
-            Err(e) => {
+            "error" => {
                 errors += 1;
-                failures.push(format!("[error] {} ({kind}): {e}", g.name));
-                ("error", false)
+                failures.push(format!("[error] {} ({kind}): {err}", g.name));
             }
-        };
+            _ => {
+                silent += 1;
+                failures.push(format!("[silent] {} ({kind}) [{tried} titles tried]", g.name));
+            }
+        }
         if oneline {
             println!("{status}\t{kind}\t{}\t{}", ext as u8, g.name);
         }
@@ -822,6 +859,9 @@ fn pc98_sweep(
         return; // per-set lines already emitted; no summary
     }
     println!("pc98 sweep [{kinds}]: {total} sets, {ok} ok, {silent} silent, {timeouts} timeout, {errors} errored");
+    if late > 0 {
+        println!("  ({late} of the ok sets were silent on title 0 and audible on a later one)");
+    }
     println!("by driver kind (ok / opna-ext / total):");
     for (k, (o, ext, t)) in &by_kind {
         println!("  {k:<8} {o:>4} / {ext:>4} / {t}");
@@ -836,12 +876,51 @@ fn pc98_sweep(
     }
 }
 
-fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
+/// What a sweep decided about one set.
+enum SweepVerdict {
+    Audible,
+    Silent,
+    Error(anyhow::Error),
+}
+
+/// Rip titles until one is audible, and report which way it went along with how
+/// many titles that took.
+///
+/// A set's verdict must not rest on title 0. Title 0 is frequently the driver's
+/// stop/silence track (§4 of the driver-families notes), and a full re-rip of
+/// the 126 pc88 sets this sweep once called silent found 54 of them audible on
+/// a later title — 586 titles that title 0 alone reported dead. A healthy set
+/// still costs a single rip, because the search stops at the first audible
+/// title; only a failing set pays for the extra attempts.
+///
+/// An error ends the search rather than moving on: the errors seen here are
+/// set-level (a loader refusing the set's `.COM`), so retrying per title would
+/// only multiply the same failure.
+fn sweep_verdict<T>(
+    titles: impl Iterator<Item = T>,
+    mut rip: impl FnMut(T) -> Result<bool>,
+) -> (SweepVerdict, usize) {
+    let mut tried = 0;
+    for t in titles {
+        tried += 1;
+        match rip(t) {
+            Ok(true) => return (SweepVerdict::Audible, tried),
+            Ok(false) => {}
+            Err(e) => return (SweepVerdict::Error(e), tried),
+        }
+    }
+    (SweepVerdict::Silent, tried)
+}
+
+fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, max_titles: usize, verbose: bool) {
     let filt = filter.map(|f| f.to_lowercase());
+    let max_titles = max_titles.max(1);
     let mut total = 0;
     let mut ok = 0;
     let mut no_writes = 0;
     let mut errors = 0;
+    // Sets that needed more than title 0 to prove themselves.
+    let mut late = 0;
     // Bucket outcomes by driver kind so PC-98 planning can see which driver
     // families are already solid and which need work.
     let mut by_kind: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // (ok, total)
@@ -860,29 +939,37 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
         if set_dirs.is_empty() {
             continue;
         }
-        let Some(t0) = g.expanded_titles().into_iter().next() else {
+        let titles = g.expanded_titles();
+        if titles.is_empty() {
             continue;
-        };
+        }
         total += 1;
         let kind = g.driver.kind.clone().unwrap_or_else(|| "-".into());
         let ke = by_kind.entry(kind.clone()).or_default();
         ke.1 += 1;
 
         let opts = hoot_machine::RipOptions { seconds, clockmul: clockmul_of(g), ..Default::default() };
-        match hoot_machine::rip_title(g, &set_dirs, t0.code, &opts) {
-            Ok(o) if !hoot_log::audibility(&o.log).is_silent() => {
+        let (verdict, tried) = sweep_verdict(titles.iter().take(max_titles), |t| {
+            hoot_machine::rip_title(g, &set_dirs, t.code, &opts)
+                .map(|o| !hoot_log::audibility(&o.log).is_silent())
+        });
+        match verdict {
+            SweepVerdict::Audible => {
                 ok += 1;
                 ke.0 += 1;
+                if tried > 1 {
+                    late += 1;
+                }
             }
-            Ok(_) => {
+            SweepVerdict::Silent => {
                 no_writes += 1;
                 // Not necessarily write-free: the gate is audibility, so this
                 // also catches a set that drives the chip but never keys a
                 // note. Saying "no writes" here sent an earlier analysis
                 // hunting for a dead bus on sets that had a busy one.
-                failures.push(format!("[silent] {} ({kind})", g.name));
+                failures.push(format!("[silent] {} ({kind}) [{tried} titles tried]", g.name));
             }
-            Err(e) => {
+            SweepVerdict::Error(e) => {
                 errors += 1;
                 failures.push(format!("[error] {} ({kind}): {e}", g.name));
             }
@@ -890,6 +977,9 @@ fn sweep(cat: &Catalogue, seconds: f64, filter: Option<&str>, verbose: bool) {
     }
 
     println!("pc88 sweep: {total} sets, {ok} ok, {no_writes} silent, {errors} errored");
+    if late > 0 {
+        println!("  ({late} of the ok sets were silent on title 0 and audible on a later one)");
+    }
     println!("by driver kind (ok/total):");
     for (k, (o, t)) in &by_kind {
         println!("  {k:<10} {o:>4}/{t}");
@@ -2324,4 +2414,50 @@ fn triage(
         println!("  {failed} file(s) could not be moved");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::{sweep_verdict, SweepVerdict};
+
+    /// The whole point: a set whose title 0 is silent is not a silent set.
+    /// 43 pc88 sets cross this line.
+    #[test]
+    fn a_later_audible_title_saves_the_set() {
+        let audible = [false, false, true, false];
+        let (v, tried) = sweep_verdict(audible.iter(), |a| Ok(*a));
+        assert!(matches!(v, SweepVerdict::Audible));
+        assert_eq!(tried, 3, "the search stops at the first audible title");
+    }
+
+    /// A healthy set must not pay for the extra attempts.
+    #[test]
+    fn an_audible_title_0_costs_one_rip() {
+        let (v, tried) = sweep_verdict([true, true, true].iter(), |a| Ok(*a));
+        assert!(matches!(v, SweepVerdict::Audible));
+        assert_eq!(tried, 1);
+    }
+
+    /// Silent means every title offered was silent, and the count says how
+    /// hard we looked — a verdict from one title reads differently to one
+    /// from four.
+    #[test]
+    fn silent_reports_how_many_titles_were_tried() {
+        let (v, tried) = sweep_verdict([false, false].iter(), |a| Ok(*a));
+        assert!(matches!(v, SweepVerdict::Silent));
+        assert_eq!(tried, 2);
+    }
+
+    /// The errors seen here are set-level — a loader refusing the set's
+    /// `.COM` — so retrying per title would only multiply the same failure.
+    #[test]
+    fn an_error_ends_the_search() {
+        let mut calls = 0;
+        let (v, tried) = sweep_verdict([0, 1, 2].iter(), |_| {
+            calls += 1;
+            Err(anyhow::anyhow!("TITLE.COM does not fit at 0xa000"))
+        });
+        assert!(matches!(v, SweepVerdict::Error(_)));
+        assert_eq!((tried, calls), (1, 1));
+    }
 }
