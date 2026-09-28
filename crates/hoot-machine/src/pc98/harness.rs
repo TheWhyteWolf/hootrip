@@ -121,12 +121,14 @@ pub struct Pc98RipOptions {
     /// 3.9936 MHz / OPNA 7.9872 MHz). This paces the driver's chip timer (tempo)
     /// and is the declared device clock — used to A/B ambiguous board clocks.
     pub opn_clock_hz: Option<u32>,
-    /// Rip the FM soundtrack of a Vermouth/TGLFMP2 MIDI set: bind the `.MFM`
+    /// Rip the FM soundtrack of a Vermouth/TGLFMP2 MIDI set: bind the FM
     /// sibling of each song instead of its `.MGS`/`.MG2` MIDI data, and strip the
     /// `-m`/`-M` MIDI switch from the `fmp*` shell so FMP3 installs as an FM
     /// driver. These sets play their melody out as MIDI (which we do not capture);
-    /// the original FM soundtrack ships alongside as `.MFM` and is the only FM
-    /// copy of this music in the archive. No-op for sets without a `.MFM` sibling.
+    /// the original FM soundtrack ships alongside under the same stem and is the
+    /// only FM copy of this music in the archive (see [`fm_sibling`] for the
+    /// extensions tried). The bind and the switch are one decision: with no
+    /// sibling on disk this is a no-op, MIDI switch included.
     pub fm_variant: bool,
     /// hoot `dummysndrom`: present the PC-98 sound BIOS as installed.
     ///
@@ -770,6 +772,29 @@ fn read_set_file(dirs: &[PathBuf], name: &str) -> Result<Vec<u8>> {
     bail!("file {name:?} not found in {}", describe_dirs(dirs))
 }
 
+/// The FM soundtrack that ships beside a MIDI song, as `(name, bytes)`.
+///
+/// Vermouth/TGLFMP2 sets render their melody as MIDI and keep the original FM
+/// arrangement in the same folder under the same stem. `.MFM` is that family's
+/// convention but not the only one in the archive, so the stem is tried against
+/// each known FM extension in turn. Extensions that name a *MIDI* standard
+/// (`.GS`, `.CM`, `.LA`, …) are deliberately absent: binding one of those would
+/// hand the driver MIDI data while telling it to drive the chip, which is the
+/// same mis-pairing [`Pc98Opts::fm_variant`]'s `-m` handling exists to avoid.
+///
+/// Returns `None` when nothing beside the song is FM data, which is a real
+/// outcome — some MIDI variants have no FM arrangement in this archive at all.
+fn fm_sibling(dirs: &[PathBuf], song: &str) -> Option<(String, Vec<u8>)> {
+    const FM_EXTS: &[&str] = &["MFM", "MF2", "MF1", "FM", "FMX", "FM2"];
+    let base = song.rsplit(['\\', '/', ':']).next().unwrap_or(song);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    FM_EXTS
+        .iter()
+        .map(|e| format!("{stem}.{e}"))
+        .filter(|n| !n.eq_ignore_ascii_case(base))
+        .find_map(|n| read_set_file(dirs, &n).ok().map(|d| (n, d)))
+}
+
 /// Render a set's archive folders for an error message.
 fn describe_dirs(dirs: &[PathBuf]) -> String {
     if dirs.is_empty() {
@@ -844,16 +869,23 @@ pub fn rip_title(
     // ships alongside as `.MFM`. Bind the `.MFM` sibling instead and drop `-m` from
     // the fmp shell (below) so FMP3 installs as an FM driver and writes the chip.
     let fm_variant = opts.fm_variant;
+    // Binding the FM sibling and dropping `-m` are one decision, not two: FMP3
+    // told to install as an FM driver while still holding MIDI data plays
+    // neither variant. So record whether the bind actually happened and gate
+    // the switch on it.
+    let mut fm_bound = false;
     if fm_variant {
         if let Some(sf) = &song_file {
-            let stem = sf.rsplit_once('.').map(|(s, _)| s).unwrap_or(sf);
-            let mfm = format!("{stem}.MFM");
-            match read_set_file(set_dirs, &mfm) {
-                Ok(data) => {
-                    dos.add_file(&mfm, data);
-                    song_file = Some(mfm);
+            match fm_sibling(set_dirs, sf) {
+                Some((name, data)) => {
+                    dos.add_file(&name, data);
+                    song_file = Some(name);
+                    fm_bound = true;
                 }
-                Err(e) => eprintln!("[fm-variant] no .MFM for {sf}: {e}"),
+                None => {
+                    notes.push_str(&format!("[fm-variant] no FM sibling for {sf}; kept MIDI song\n"));
+                    eprintln!("[fm-variant] no FM sibling for {sf}");
+                }
             }
         }
     }
@@ -914,7 +946,7 @@ pub fn rip_title(
     let mut shell = Vec::new();
     for rom in romlist.roms.iter().filter(|r| r.kind == "shell") {
         let mut cmd = strip_hash(&rom.name);
-        if fm_variant {
+        if fm_bound {
             // Drop the MIDI-mode switch so FMP3 installs as an FM driver.
             if cmd.to_lowercase().starts_with("fmp") {
                 cmd = cmd
@@ -1556,14 +1588,13 @@ pub fn trace_capture(
     dos.install_dos_structures(cpu.mem());
     let _ = materialize(&mut dos, romlist, set_dirs);
     let mut song_file = selected_song(romlist, title_code);
-    let fm_variant = opts.fm_variant;
-    if fm_variant {
+    let mut fm_bound = false;
+    if opts.fm_variant {
         if let Some(sf) = &song_file {
-            let stem = sf.rsplit_once('.').map(|(s, _)| s).unwrap_or(sf);
-            let mfm = format!("{stem}.MFM");
-            if let Ok(data) = read_set_file(set_dirs, &mfm) {
-                dos.add_file(&mfm, data);
-                song_file = Some(mfm);
+            if let Some((name, data)) = fm_sibling(set_dirs, sf) {
+                dos.add_file(&name, data);
+                song_file = Some(name);
+                fm_bound = true;
             }
         }
     }
@@ -1615,7 +1646,7 @@ pub fn trace_capture(
     }
     for rom in romlist.roms.iter().filter(|r| r.kind == "shell") {
         let mut cmd = strip_hash(&rom.name);
-        if fm_variant && cmd.to_lowercase().starts_with("fmp") {
+        if fm_bound && cmd.to_lowercase().starts_with("fmp") {
             cmd = cmd
                 .split_whitespace()
                 .filter(|tok| !tok.eq_ignore_ascii_case("-m") && !tok.eq_ignore_ascii_case("m"))
@@ -1867,5 +1898,53 @@ mod console_tests {
     fn a_stray_escape_does_not_swallow_the_message() {
         assert_eq!(console_text(b"ok\x1bdone"), "ok\u{1b}done");
         assert_eq!(console_text(b"ok\x1b[999"), "ok");
+    }
+}
+
+#[cfg(test)]
+mod fm_sibling_tests {
+    use super::fm_sibling;
+    use std::path::PathBuf;
+
+    /// A throwaway set folder holding `files`, returned as the `dirs` slice
+    /// `fm_sibling` takes.
+    fn set_dir(tag: &str, files: &[&str]) -> Vec<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("hootrip-fmsib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"data").unwrap();
+        }
+        vec![dir]
+    }
+
+    /// `.MFM` is the Vermouth convention, but the archive also ships the FM
+    /// arrangement as `.FM`/`.FMX`/`.FM2`; a stem-match under any of those is
+    /// the same music.
+    #[test]
+    fn an_fm_arrangement_is_found_under_any_of_its_extensions() {
+        for ext in ["MFM", "MF2", "FM", "FMX", "FM2"] {
+            let dirs = set_dir(&format!("ext-{ext}"), &[&format!("SONG01.{ext}")]);
+            let hit = fm_sibling(&dirs, "SONG01.MGS");
+            assert_eq!(hit.map(|(n, _)| n.to_uppercase()), Some(format!("SONG01.{ext}")));
+        }
+    }
+
+    /// `.GS`/`.CM`/`.LA` name MIDI targets, not FM data. Binding one would hand
+    /// the driver MIDI bytes while the shell tells it to drive the chip — the
+    /// mis-pairing the `-m` gate exists to prevent — so no sibling is the right
+    /// answer here, and the caller keeps the MIDI song and the `-m` switch.
+    #[test]
+    fn a_midi_target_is_not_mistaken_for_the_fm_arrangement() {
+        let dirs = set_dir("midi", &["SONG01.GS", "SONG01.CM", "SONG01.LA", "SONG01.MD"]);
+        assert!(fm_sibling(&dirs, "SONG01.MGS").is_none());
+    }
+
+    /// The song itself is not its own sibling: an FM-extension song with no
+    /// arrangement beside it must not rebind to the file already selected.
+    #[test]
+    fn the_song_is_not_its_own_sibling() {
+        let dirs = set_dir("self", &["SONG01.FM"]);
+        assert!(fm_sibling(&dirs, "SONG01.FM").is_none());
     }
 }
