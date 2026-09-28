@@ -1441,3 +1441,34 @@ did not add up.
 4. **The 36 MIDI variants with no working twin**, of which some will have no
    FM arrangement in this archive at all and should be excluded rather than
    chased.
+
+### 19.5 — What `metajo` looks like when it fails
+
+A first diagnostic on `Zwei Metajo (86)`, recorded so whoever takes item 1
+does not start from nothing. The titles are real: `metajo2_98` holds 880 files,
+776 `.PCH` and 100 `.PKO`, which is where 898 comes from — this is a music
+collection, not a mis-parsed title list.
+
+The re-host itself succeeds. `PCP /S` and `PCML /S /M16` both go resident, the
+`PKO_98` stub reports ready, INT 7Fh is installed and the trigger runs. Then:
+
+```
+FM writes    : 44 total, 34 captured
+write span   : 0.000s .. 0.001s  (of 5.0s capture)
+reg 0x27 timer-ctrl writes: 1   values: 0x30×1
+timer IRQs   : 0        opn timer used: false
+unmodelled ports: 0x0088(r0/w2) 0x008a(r3/w2) 0xa66e(r1/w0)
+```
+
+The driver touches the chip once and stops. Reg 0x27 is written only with
+`0x30` — clear both timer flags — so timer A/B are never programmed and
+nothing paces a sequence. That is §8's bucket B shape (pacing source hooked
+but not running), except no pacing source is hooked at all.
+
+The unmodelled ports are the more interesting half. `0xa66e` is in the
+PC-9801-86 PCM range, and the driver chain is `PCP`/`PCML`/`PKO` with the
+sibling entry named `(OPNA+SSGPCM)`. This set's music may be substantially
+PCM — 86-board PCM on one variant, SSG-volume PCM on the other — in which
+case the FM-write count is the wrong thing to be watching and both an
+unmodelled port and an audibility question are in play before any driver
+work starts.
